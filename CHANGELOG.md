@@ -2,7 +2,7 @@
 
 ## 0.18.2-win7.8 — 2026-10-21
 
-Первая публичная сборка, основана на SolidCraft 0.18.2.
+Первая публичная сборка. Исходники: SolidCraft [v0.18.2](https://github.com/tangency-labs/solidcraft/releases/tag/v0.18.2), коммит 4927214976ff20758fde35af03bd6b2d6cf73e18.
 
 - Цель x86_64-win7-windows-gnu, статический CRT: дополнительные библиотеки Visual C++ не нужны.
 - w7shim.dll: GetOverlappedResultEx, PathCchStripPrefix, RoOriginateErrorW, CoTaskMemFree, CoCreateFreeThreadedMarshaler для Windows 7; GetDpiForWindow / GetSystemMetricsForDpi — поиск во время работы.

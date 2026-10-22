@@ -7,6 +7,7 @@
 
 <p align="center">
   <a href="../../releases/latest"><img src="https://img.shields.io/github/v/release/ed1385/solidcraft-win7?label=%D1%80%D0%B5%D0%BB%D0%B8%D0%B7" alt="Релиз"></a>
+  <a href="https://github.com/tangency-labs/solidcraft/releases/tag/v0.18.2"><img src="https://img.shields.io/badge/%D0%B8%D1%81%D1%85%D0%BE%D0%B4%D0%BD%D0%B8%D0%BA%D0%B8-SolidCraft%200.18.2-orange" alt="Исходники SolidCraft 0.18.2"></a>
   <img src="https://img.shields.io/badge/Windows-7%20SP1%20x64-0078D6" alt="Windows 7 SP1 x64">
   <img src="https://img.shields.io/badge/%D0%B3%D1%80%D0%B0%D1%84%D0%B8%D0%BA%D0%B0-Direct3D%2011%20(ANGLE)-555" alt="Direct3D 11">
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-blue" alt="Лицензия"></a>
@@ -18,7 +19,7 @@
 
 **SolidCraft** — открытая параметрическая 3D CAD на Rust (эскизы, твёрдые тела, поверхности, листовой металл, сборки, экспорт STEP/STL/3MF). Её разрабатывает проект [tangency-labs/solidcraft](https://github.com/tangency-labs/solidcraft); официальные сборки выходят только для Windows 10/11, macOS и Linux.
 
-**Этот репозиторий** — сборочный форк SolidCraft под **Windows 7 SP1 x64**: исходники берутся у автора, функциональность CAD не меняется, а здесь хранятся патчи совместимости с Windows 7, скрипты сборки и **готовые установщики** в [Releases](../../releases). Каждый релиз здесь соответствует версии официального проекта.
+**Этот репозиторий** — сборочный форк SolidCraft под **Windows 7 SP1 x64**: исходники берутся у автора, функциональность CAD не меняется, а здесь хранятся патчи совместимости с Windows 7, скрипты сборки и **готовые установщики** в [Releases](../../releases). Каждый релиз здесь соответствует версии официального проекта — см. раздел «[Версия исходного кода](#версия-исходного-кода)».
 
 ### Какую задачу решает
 
@@ -33,6 +34,33 @@
 | Буквальный русский перевод, надписи обрезаются на ленте | Перевод в терминологии Компас/SolidWorks, сокращения, проверка помещаемости по шрифту интерфейса |
 
 Сборка проверена на: Windows 7 Профессиональная SP1 x64, Intel Core i5-3450, встроенная графика **Intel HD Graphics 2500** (драйвер 9.17.10.4229).
+
+## Версия исходного кода
+
+Текущий релиз собран из **официальных исходников SolidCraft 0.18.2** без изменения функциональности CAD:
+
+| | |
+|---|---|
+| Официальный проект | [tangency-labs/solidcraft](https://github.com/tangency-labs/solidcraft) |
+| Версия (тег) | [**v0.18.2**](https://github.com/tangency-labs/solidcraft/releases/tag/v0.18.2) от 21.10.2026 |
+| Коммит | [4927214976ff20758fde35af03bd6b2d6cf73e18](https://github.com/tangency-labs/solidcraft/commit/4927214976ff20758fde35af03bd6b2d6cf73e18) |
+| Архив исходников | [solidcraft-4927214.zip](https://github.com/tangency-labs/solidcraft/archive/4927214976ff20758fde35af03bd6b2d6cf73e18.zip) |
+| Сборка для Windows 7 | [v0.18.2-win7.8](../../releases/tag/v0.18.2-win7.8) |
+
+### Соответствие версий
+
+| Релиз здесь | Исходники SolidCraft | Коммит | Дата сборки |
+|---|---|---|---|
+| [v0.18.2-win7.8](../../releases/tag/v0.18.2-win7.8) | [v0.18.2](https://github.com/tangency-labs/solidcraft/releases/tag/v0.18.2) | [4927214](https://github.com/tangency-labs/solidcraft/commit/4927214976ff20758fde35af03bd6b2d6cf73e18) | 21.10.2026 |
+
+### Обновления
+
+Сборка следует за официальным проектом: после выхода новой стабильной версии SolidCraft здесь публикуется релиз для Windows 7 из тех же исходников.
+
+- **Имя релиза:** vX.Y.Z-win7.N, где X.Y.Z — версия SolidCraft, а N — номер сборки для Windows 7 (растёт при каждой новой сборке, в том числе при исправлениях только совместимости).
+- **Что указывается в каждом релизе:** тег и коммит официальных исходников, список изменений совместимости.
+- **Ночные сборки** автора (nightly) не собираются — только стабильные версии.
+- **Как узнать о новой версии:** кнопка **Watch → Custom → Releases** вверху страницы репозитория.
 
 ## Скачать и установить
 
@@ -105,6 +133,6 @@ SolidCraft © SolidCraft contributors, лицензии MIT или Apache 2.0 н
 
 **Unofficial Windows 7 SP1 x64 build of [SolidCraft](https://github.com/tangency-labs/solidcraft)**, the open-source parametric 3D CAD written in Rust. Upstream ships Windows 10/11, macOS and Linux builds only. This is a build fork: CAD features are unchanged; the repository holds the Windows 7 compatibility patches, build scripts and the compiled installers, one release per upstream version.
 
-Key changes: x86_64-win7-windows-gnu target with build-std; Windows 8+ API imports replaced by runtime lookups and a small w7shim.dll; rendering through ANGLE (OpenGL ES 3.0 on Direct3D 11) via a patched wgpu-hal EGL path, because Windows 7 has no D3D12/Vulkan and old OpenGL 4.0 drivers render black; native window frame; Russian UI catalog using standard CAD terminology. Download the MSI from [Releases](../../releases/latest); build steps are in [BUILD.md](BUILD.md).
+Key changes: x86_64-win7-windows-gnu target with build-std; Windows 8+ API imports replaced by runtime lookups and a small w7shim.dll; rendering through ANGLE (OpenGL ES 3.0 on Direct3D 11) via a patched wgpu-hal EGL path, because Windows 7 has no D3D12/Vulkan and old OpenGL 4.0 drivers render black; native window frame; Russian UI catalog using standard CAD terminology. Current release is built from upstream **v0.18.2** (commit 4927214976ff20758fde35af03bd6b2d6cf73e18); every new stable upstream version gets a matching vX.Y.Z-win7.N release here. Download the MSI from [Releases](../../releases/latest); build steps are in [BUILD.md](BUILD.md).
 
 </details>
