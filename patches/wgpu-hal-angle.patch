@@ -1,0 +1,79 @@
+diff -ruN '--exclude=.cargo_vcs_info.json' ./Cargo.toml /home/claude/src/solidcraft-0.18.2/vendor/wgpu-hal/Cargo.toml
+--- a/Cargo.toml	2006-07-24 01:21:28.000000000 +0000
++++ b/Cargo.toml	2026-10-21 16:26:26.634949226 +0000
+@@ -108,6 +108,8 @@
+     "windows/Win32_UI_WindowsAndMessaging",
+ ]
+ internal_error_panic = []
++# SolidCraft Windows 7 build: the GLES backend through EGL (ANGLE on Direct3D 11) instead of WGL.
++angle_win = ["gles"]
+ metal = [
+     "naga/msl-out",
+     "dep:arrayvec",
+diff -ruN '--exclude=.cargo_vcs_info.json' ./src/gles/egl.rs /home/claude/src/solidcraft-0.18.2/vendor/wgpu-hal/src/gles/egl.rs
+--- a/src/gles/egl.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/src/gles/egl.rs	2026-10-21 16:27:31.723308665 +0000
+@@ -1,4 +1,20 @@
+ use alloc::{string::String, sync::Arc, vec::Vec};
++
++/// SolidCraft Windows 7 build: Wayland does not exist on Windows; these stand-ins keep the
++/// Wayland code paths compiling (they are never reached: no Wayland window handle on Windows).
++#[cfg(windows)]
++#[allow(non_camel_case_types, dead_code)]
++mod wayland_sys {
++    pub mod egl {
++        pub enum wl_egl_window {}
++        pub fn wayland_egl_handle() {}
++    }
++    macro_rules! ffi_dispatch {
++        ($($t:tt)*) => {{ let _ = stringify!($($t)*); }};
++    }
++    pub(crate) use ffi_dispatch;
++}
++
+ use core::{ffi, mem::ManuallyDrop, ptr, time::Duration};
+ use std::sync::LazyLock;
+ 
+diff -ruN '--exclude=.cargo_vcs_info.json' ./src/gles/mod.rs /home/claude/src/solidcraft-0.18.2/vendor/wgpu-hal/src/gles/mod.rs
+--- a/src/gles/mod.rs	2006-07-24 01:21:28.000000000 +0000
++++ b/src/gles/mod.rs	2026-10-21 16:26:26.635624277 +0000
+@@ -80,13 +80,13 @@
+ */
+ 
+ ///cbindgen:ignore
+-#[cfg(not(any(windows, webgl)))]
++#[cfg(any(not(any(windows, webgl)), all(windows, feature = "angle_win")))]
+ mod egl;
+ #[cfg(Emscripten)]
+ mod emscripten;
+ #[cfg(webgl)]
+ mod web;
+-#[cfg(windows)]
++#[cfg(all(windows, not(feature = "angle_win")))]
+ mod wgl;
+ 
+ mod adapter;
+@@ -98,9 +98,9 @@
+ 
+ pub use fence::Fence;
+ 
+-#[cfg(not(any(windows, webgl)))]
++#[cfg(any(not(any(windows, webgl)), all(windows, feature = "angle_win")))]
+ pub use self::egl::{AdapterContext, AdapterContextLock};
+-#[cfg(not(any(windows, webgl)))]
++#[cfg(any(not(any(windows, webgl)), all(windows, feature = "angle_win")))]
+ pub use self::egl::{Instance, Surface};
+ 
+ #[cfg(webgl)]
+@@ -108,9 +108,9 @@
+ #[cfg(webgl)]
+ pub use self::web::{Instance, Surface};
+ 
+-#[cfg(windows)]
++#[cfg(all(windows, not(feature = "angle_win")))]
+ use self::wgl::AdapterContext;
+-#[cfg(windows)]
++#[cfg(all(windows, not(feature = "angle_win")))]
+ pub use self::wgl::{Instance, Surface};
+ 
+ use alloc::{boxed::Box, string::String, string::ToString as _, sync::Arc, vec::Vec};

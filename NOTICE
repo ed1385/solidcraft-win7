@@ -1,0 +1,12 @@
+SolidCraft for Windows 7 (ed1385/solidcraft-win7)
+
+Unofficial Windows 7 SP1 x64 build of SolidCraft (https://github.com/tangency-labs/solidcraft).
+SolidCraft: Copyright (c) 2026 SolidCraft contributors. Licensed under the MIT License or the
+Apache License, Version 2.0, at your option (LICENSE-MIT, LICENSE-APACHE).
+
+Patches, scripts and the Russian translation in this repository: Copyright (c) 2026 ed1385,
+licensed under the same terms (MIT or Apache-2.0, at your option).
+
+Release binaries include ANGLE (libEGL.dll, libGLESv2.dll) from Electron 22.3.27,
+Copyright The ANGLE Project Authors, BSD-style licence, and d3dcompiler_47.dll (Microsoft),
+redistributed as part of Electron. wgpu-hal is patched under its MIT/Apache-2.0 licence.

@@ -1,0 +1,10 @@
+out/
+*.exe
+*.dll
+*.msi
+*.zip
+*.wixobj
+*.wixpdb
+gpu-report.txt
+needed.json
+__pycache__/

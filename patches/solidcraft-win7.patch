@@ -1,0 +1,1841 @@
+diff -ruN '--exclude=target' '--exclude=wgpu-hal' ./Cargo.lock /home/claude/src/solidcraft-0.18.2/Cargo.lock
+--- a/Cargo.lock	2026-10-21 02:09:18.000000000 +0000
++++ b/Cargo.lock	2026-10-21 16:26:37.609860455 +0000
+@@ -4187,6 +4187,7 @@
+  "solidcraft-space-mouse",
+  "solidcraft-ui-egui",
+  "ureq",
++ "wgpu-hal",
+  "windows-sys 0.61.2",
+  "winit",
+ ]
+@@ -5400,8 +5401,6 @@
+ [[package]]
+ name = "wgpu-hal"
+ version = "30.0.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b6b7fb58561a792bc237628ba0792e332de418fefe145f13b5ed8201e6d52f58"
+ dependencies = [
+  "android_system_properties",
+  "arrayvec",
+diff -ruN '--exclude=target' '--exclude=wgpu-hal' ./Cargo.toml /home/claude/src/solidcraft-0.18.2/Cargo.toml
+--- a/Cargo.toml	2026-10-21 02:09:18.000000000 +0000
++++ b/Cargo.toml	2026-10-21 16:26:37.009860479 +0000
+@@ -153,9 +153,24 @@
+ 
+ # Keep OpenGL pipelines, resolve textures and CAD callbacks at the same safe sample count.
+ egui-wgpu = { path = "vendor/egui-wgpu" }
++# Windows 7 build: optional EGL/ANGLE path for the GLES backend (feature angle_win).
++wgpu-hal = { path = "vendor/wgpu-hal" }
+ 
+ # Mutation testing (cargo-mutants, docs/mutation-testing.md): the ci profile with incremental
+ # builds, since every mutant rebuilds the crates above the one it changes.
+ [profile.mutants]
+ inherits = "ci"
+ incremental = true
++
++# Windows 7 build (x86_64-win7-windows-gnu): no LTO and no debug info to fit a small build machine.
++[profile.win7]
++inherits = "release"
++lto = false
++debug = false
++codegen-units = 16
++incremental = false
++strip = true
++
++# Huge generated code: lighter optimisation keeps rustc's memory under 3 GB.
++[profile.win7.package.cadmpeg-ir]
++opt-level = 1
+diff -ruN '--exclude=target' '--exclude=wgpu-hal' ./apps/solidcraft/Cargo.toml /home/claude/src/solidcraft-0.18.2/apps/solidcraft/Cargo.toml
+--- a/apps/solidcraft/Cargo.toml	2026-10-21 02:09:18.000000000 +0000
++++ b/apps/solidcraft/Cargo.toml	2026-10-21 16:26:37.015868374 +0000
+@@ -41,6 +41,12 @@
+ # Keychain on macOS, Credential Manager on Windows, the Secret Service (pure-Rust D-Bus) elsewhere.
+ keyring = { version = "3.6", default-features = false, features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
+ 
++# Windows 7 build: `--features angle` draws through ANGLE (OpenGL ES on Direct3D 11).
++wgpu-hal = { version = "=30.0.1", optional = true, default-features = false, features = ["angle_win"] }
++
++[features]
++angle = ["dep:wgpu-hal"]
++
+ [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))'.dependencies]
+ quick-xml = { workspace = true }
+ 
+diff -ruN '--exclude=target' '--exclude=wgpu-hal' ./apps/solidcraft/src/main.rs /home/claude/src/solidcraft-0.18.2/apps/solidcraft/src/main.rs
+--- a/apps/solidcraft/src/main.rs	2026-10-21 02:09:18.000000000 +0000
++++ b/apps/solidcraft/src/main.rs	2026-10-21 17:08:01.152973976 +0000
+@@ -28,6 +28,8 @@
+ #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+ mod space_mouse;
+ mod startup;
++#[cfg(target_os = "windows")]
++mod win7;
+ 
+ use solidcraft_engine::{Session, io};
+ use solidcraft_ui_egui::{Services, SolveApp};
+@@ -46,10 +48,11 @@
+     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+         if self.frames < 2 {
+             self.frames += 1;
++            eprintln!("SolidCraft: frame {} drawn, window {:?}", self.frames, ctx.content_rect());
+             // A second frame right away, which means the first was presented: the app is up.
+             ctx.request_repaint();
+             if self.frames == 2 {
+-                solidcraft_engine::crash::phase(solidcraft_engine::crash::RUNNING);
++                log_phase(solidcraft_engine::crash::RUNNING);
+                 if let Some(dir) = self.starting.take() {
+                     startup::started(&dir);
+                 }
+@@ -442,7 +445,12 @@
+ 
+ /// Windows and Linux: no OS title bar; the application bar is the title bar
+ /// (`solidcraft_ui_egui::titlebar`). macOS keeps its traffic lights over the integrated bar.
+-const CUSTOM_TITLEBAR: bool = !cfg!(target_os = "macos");
++/// Windows 7 build: the standard Windows frame by default (`--custom-frame` for SolidCraft's own).
++static CUSTOM_FRAME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++#[allow(non_snake_case)]
++fn CUSTOM_TITLEBAR() -> bool {
++    !cfg!(target_os = "macos") && CUSTOM_FRAME.load(std::sync::atomic::Ordering::Relaxed)
++}
+ 
+ const DEPTH_BITS: u8 = 24;
+ /// A 32-bit float depth buffer, drawn with reversed depth (1 near, 0 far) so its precision follows
+@@ -466,7 +474,7 @@
+         .with_inner_size([1600.0, 1000.0])
+         .with_min_inner_size([960.0, 600.0])
+         .with_drag_and_drop(true)
+-        .with_decorations(!CUSTOM_TITLEBAR)
++        .with_decorations(!CUSTOM_TITLEBAR())
+         .with_fullsize_content_view(true)
+         .with_titlebar_shown(false)
+         .with_title_shown(false)
+@@ -477,6 +485,17 @@
+ const APP_ID: &str = solidcraft_engine::io::APP_ID;
+ 
+ fn main() -> eframe::Result {
++    #[cfg(target_os = "windows")]
++    {
++        win7::redirect_stderr();
++        win7::install_logger();
++        eprintln!("SolidCraft {} (Windows 7 build{}) starting", env!("CARGO_PKG_VERSION"), if cfg!(feature = "angle") { ", ANGLE / Direct3D 11" } else { "" });
++    }
++    let mut software_gl = false;
++    let mut hardware_gl = false;
++    if let Ok(r) = std::env::var("SOLIDCRAFT_W7_REASON") {
++        eprintln!("SolidCraft: graphics chosen automatically ({r})");
++    }
+     adopt_legacy_settings();
+     let mut safe_mode = startup::env_on(std::env::var(startup::SAFE_MODE_ENV).ok().as_deref());
+     let mut control_port: Option<u16> = solidcraft_engine::geom::env::var("CONTROL_PORT").and_then(|p| p.parse().ok());
+@@ -488,6 +507,9 @@
+             "--control" => control_port = args.next().and_then(|p| p.parse().ok()),
+             "--sample" => sample = true,
+             "--safe-mode" => safe_mode = true,
++            "--software" => software_gl = true,
++            "--hardware-gl" => hardware_gl = true,
++            "--custom-frame" => CUSTOM_FRAME.store(true, std::sync::atomic::Ordering::Relaxed),
+             "--version" | "-V" => {
+                 println!("solidcraft {}", env!("CARGO_PKG_VERSION"));
+                 return Ok(());
+@@ -512,6 +534,40 @@
+             _ => files.push(a),
+         }
+     }
++    // ANGLE build: the software renderer and safe mode are the Mesa build's (solidcraft.exe).
++    #[cfg(target_os = "windows")]
++    if cfg!(feature = "angle") && (software_gl || safe_mode) && let Some(main) = sibling("solidcraft.exe") {
++        let mut cmd = std::process::Command::new(main);
++        cmd.args(std::env::args_os().skip(1));
++        if !software_gl {
++            cmd.arg("--software");
++        }
++        if let Ok(st) = cmd.status() {
++            std::process::exit(st.code().unwrap_or(0));
++        }
++    }
++    // Windows 7 build: an OpenGL driver older than 4.3 with no D3D12/Vulkan (Intel HD 2000…4000)
++    // presents black frames; start again on the software renderer instead (`--hardware-gl` keeps it).
++    #[cfg(target_os = "windows")]
++    if !cfg!(feature = "angle") && !safe_mode && !software_gl && !hardware_gl && std::env::var(startup::RENDERER_ENV).is_err()
++        && std::env::var(startup::WGPU_BACKEND_ENV).is_err() && backend_preference().is_none()
++        && let Some(reason) = old_hardware_gl()
++    {
++        // Direct3D 11 through ANGLE when its build is installed beside this one; else Mesa.
++        if let Some(angle) = sibling("solidcraft-angle.exe").filter(|_| sibling("libGLESv2.dll").is_some()) {
++            eprintln!("SolidCraft: {reason}; starting the ANGLE (Direct3D 11) build");
++            if let Ok(st) = std::process::Command::new(angle).args(std::env::args_os().skip(1)).env("SOLIDCRAFT_W7_REASON", &reason).status() {
++                std::process::exit(st.code().unwrap_or(0));
++            }
++        }
++        eprintln!("SolidCraft: {reason}; restarting with software OpenGL");
++        if let Ok(exe) = std::env::current_exe() {
++            let status = std::process::Command::new(exe).args(std::env::args_os().skip(1)).arg("--software").env("SOLIDCRAFT_W7_REASON", &reason).status();
++            if let Ok(st) = status {
++                std::process::exit(st.code().unwrap_or(0));
++            }
++        }
++    }
+     // Settings that don't read are moved aside; launches that never got a window are counted,
+     // and after a few in a row this one starts in safe mode (docs/book/src/guide/troubleshooting.md).
+     let settings = settings_dir();
+@@ -525,7 +581,11 @@
+         safe_mode = true;
+         notes.push(format!("The last {failed_starts} launches stopped before the window opened, so this one is in safe mode."));
+     }
+-    let cpu_renderer = safe_mode || startup::cpu_renderer_env(std::env::var(startup::RENDERER_ENV).ok().as_deref());
++    let cpu_renderer = safe_mode || software_gl || startup::cpu_renderer_env(std::env::var(startup::RENDERER_ENV).ok().as_deref());
++    #[cfg(target_os = "windows")]
++    if cpu_renderer && !cfg!(feature = "angle") {
++        win7::preload_software_gl();
++    }
+     if safe_mode {
+         notes.push("Safe mode: default settings (yours are kept for the next normal start), no recovery offer, software rendering.".into());
+     }
+@@ -548,7 +608,7 @@
+     #[cfg(target_os = "windows")]
+     native_crash::install();
+     eframe::egui_wgpu::set_startup_hook(startup_step);
+-    solidcraft_engine::crash::phase("window");
++    log_phase("window");
+     let options = eframe::NativeOptions {
+         viewport: app_viewport()?,
+         depth_buffer: depth_bits,
+@@ -592,17 +652,17 @@
+         options,
+         Box::new(move |cc| {
+             created_in_app.store(true, std::sync::atomic::Ordering::SeqCst);
+-            solidcraft_engine::crash::phase("app setup");
++            log_phase("app setup");
+             solidcraft_ui_egui::fonts::setup_fonts(&cc.egui_ctx);
+             let mut app = SolveApp::new(Session::default(), services(cc));
+             app.apply_off_thread = Some(solidcraft_ui_egui::dialogs::APPLY_AT_ONCE);
+-            app.custom_titlebar = CUSTOM_TITLEBAR;
++            app.custom_titlebar = CUSTOM_TITLEBAR();
+             // Windows: the OS hit test offers the resize border, at the window's DPI, from the
+             // first message (#1381).
+             #[cfg(target_os = "windows")]
+             {
+-                app.native_resize_border = CUSTOM_TITLEBAR && native_frame::install(cc);
+-                if CUSTOM_TITLEBAR && !app.native_resize_border {
++                app.native_resize_border = CUSTOM_TITLEBAR() && native_frame::install(cc);
++                if CUSTOM_TITLEBAR() && !app.native_resize_border {
+                     eprintln!("SolidCraft window: no native resize border; egui edge zones instead");
+                 }
+             }
+@@ -613,7 +673,7 @@
+             }
+             if let Some(rs) = &cc.wgpu_render_state {
+                 eprintln!("SolidCraft graphics: {:?}, MSAA {}x (requested {}x)", rs.adapter.get_info().backend, rs.msaa_samples, samples);
+-                solidcraft_engine::crash::phase("viewport pipelines (shader compile)");
++                log_phase("viewport pipelines (shader compile)");
+                 app.set_wgpu(rs, depth_bits, STENCIL_BITS, rs.msaa_samples);
+                 solidcraft_ui_egui::gpu::install_picture_renderer(rs);
+                 // The graphics driver is loaded now; it may have put its own exception filter
+@@ -680,7 +740,7 @@
+             }
+             #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+             let space_mouse = space_mouse::SpaceMouse::start(&cc.egui_ctx);
+-            solidcraft_engine::crash::phase("first frame");
++            log_phase("first frame");
+             Ok(Box::new(App {
+                 solve: app,
+                 starting,
+@@ -700,10 +760,11 @@
+ /// egui-wgpu is about to start a step of getting the graphics device and the window's surface up:
+ /// the crash journal keeps it, and the adapter once it is picked.
+ fn startup_step(step: &'static str, detail: &str) {
++    eprintln!("SolidCraft step: {step} {detail}");
+     if step == eframe::egui_wgpu::STEP_ADAPTER_CHOSEN {
+         solidcraft_engine::crash::set_environment(&format!("Renderer: {detail}"));
+     }
+-    solidcraft_engine::crash::phase(step);
++    log_phase(step);
+ }
+ 
+ /// The renderer settings: with `cpu`, the software adapter (WARP, lavapipe, llvmpipe). The
+@@ -736,6 +797,15 @@
+ fn no_window(error: eframe::Error, tried_cpu: bool, settings: Option<&std::path::Path>) -> eframe::Result {
+     log::error!("the window could not open: {error}");
+     eprintln!("SolidCraft: the window could not open: {error}");
++    #[cfg(target_os = "windows")]
++    if cfg!(feature = "angle") && let Some(main) = sibling("solidcraft.exe") {
++        eprintln!("SolidCraft: ANGLE could not open the window; starting software OpenGL (solidcraft.exe --software)");
++        match std::process::Command::new(main).args(std::env::args_os().skip(1)).arg("--software").status() {
++            Ok(status) if status.success() => return Ok(()),
++            Ok(_) => return Err(error),
++            Err(e) => log::error!("could not start solidcraft.exe: {e}"),
++        }
++    }
+     if !tried_cpu && let Ok(exe) = std::env::current_exe() {
+         eprintln!("SolidCraft: trying again with the software renderer ({}=cpu)", startup::RENDERER_ENV);
+         match std::process::Command::new(exe).args(std::env::args_os().skip(1)).env(startup::RENDERER_ENV, "cpu").status() {
+@@ -849,3 +919,39 @@
+         }
+     }
+ }
++
++/// The startup step, in the crash journal and in the log file.
++fn log_phase(step: &str) {
++    eprintln!("SolidCraft phase: {step}");
++    solidcraft_engine::crash::phase(step);
++}
++
++/// Windows 7 build: why the hardware OpenGL driver is not used (`None`: D3D12 or Vulkan is there,
++/// or the OpenGL driver is 4.3 or newer).
++#[cfg(target_os = "windows")]
++fn old_hardware_gl() -> Option<String> {
++    use eframe::wgpu::Backends;
++    if startup::has_hardware_adapter(Backends::DX12) || startup::has_hardware_adapter(Backends::VULKAN) {
++        return None;
++    }
++    let mut desc = eframe::wgpu::InstanceDescriptor::new_without_display_handle();
++    desc.backends = Backends::GL;
++    let instance = eframe::wgpu::Instance::new(desc);
++    let adapters = pollster::block_on(instance.enumerate_adapters(Backends::GL));
++    let hw: Vec<_> = adapters.iter().map(|a| a.get_info()).filter(|i| i.device_type != eframe::wgpu::DeviceType::Cpu).collect();
++    if hw.is_empty() {
++        return Some("no hardware graphics adapter".into());
++    }
++    let version = |s: &str| -> (u32, u32) {
++        let mut it = s.trim().split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).map(|p| p.parse::<u32>().unwrap_or(0));
++        (it.next().unwrap_or(0), it.next().unwrap_or(0))
++    };
++    let new_enough = hw.iter().any(|i| version(&i.driver_info) >= (4, 3));
++    (!new_enough).then(|| format!("OpenGL {} on {} is older than 4.3", hw[0].driver_info.trim(), hw[0].name))
++}
++
++/// A file next to this exe, if it is there.
++#[cfg(target_os = "windows")]
++fn sibling(name: &str) -> Option<std::path::PathBuf> {
++    std::env::current_exe().ok()?.parent().map(|d| d.join(name)).filter(|p| p.is_file())
++}
+diff -ruN '--exclude=target' '--exclude=wgpu-hal' ./apps/solidcraft/src/native_frame.rs /home/claude/src/solidcraft-0.18.2/apps/solidcraft/src/native_frame.rs
+--- a/apps/solidcraft/src/native_frame.rs	2026-10-21 02:09:18.000000000 +0000
++++ b/apps/solidcraft/src/native_frame.rs	2026-10-21 12:49:51.365011470 +0000
+@@ -26,7 +26,48 @@
+ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+ use solidcraft_ui_egui::titlebar;
+ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, SIZE, WPARAM};
+-use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
++use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
++use windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics;
++
++// Windows 7: GetDpiForWindow and GetSystemMetricsForDpi appeared in Windows 10 (1607). They are
++// looked up in user32 at run time; without them the window counts as 96 DPI and the plain
++// GetSystemMetrics is used, so the exe still loads on Windows 7.
++type DpiForWindowFn = unsafe extern "system" fn(HWND) -> u32;
++type MetricsForDpiFn = unsafe extern "system" fn(i32, u32) -> i32;
++
++fn user32_proc(name: &[u8]) -> Option<unsafe extern "system" fn() -> isize> {
++    let module: Vec<u16> = "user32.dll\0".encode_utf16().collect();
++    // SAFETY: NUL-terminated strings; user32 is always loaded in a GUI process.
++    unsafe {
++        let h = GetModuleHandleW(module.as_ptr());
++        if h.is_null() {
++            return None;
++        }
++        GetProcAddress(h, name.as_ptr())
++    }
++}
++
++#[allow(non_snake_case)]
++unsafe fn GetDpiForWindow(hwnd: HWND) -> u32 {
++    static F: std::sync::OnceLock<Option<DpiForWindowFn>> = std::sync::OnceLock::new();
++    // SAFETY: the symbol, when present, has this signature.
++    let f = F.get_or_init(|| user32_proc(b"GetDpiForWindow\0").map(|p| unsafe { std::mem::transmute::<_, DpiForWindowFn>(p) }));
++    match f {
++        Some(f) => unsafe { f(hwnd) },
++        None => 96,
++    }
++}
++
++#[allow(non_snake_case)]
++unsafe fn GetSystemMetricsForDpi(index: i32, dpi: u32) -> i32 {
++    static F: std::sync::OnceLock<Option<MetricsForDpiFn>> = std::sync::OnceLock::new();
++    // SAFETY: the symbol, when present, has this signature.
++    let f = F.get_or_init(|| user32_proc(b"GetSystemMetricsForDpi\0").map(|p| unsafe { std::mem::transmute::<_, MetricsForDpiFn>(p) }));
++    match f {
++        Some(f) => unsafe { f(index, dpi) },
++        None => unsafe { GetSystemMetrics(index) },
++    }
++}
+ use windows_sys::Win32::UI::WindowsAndMessaging::{
+     CallWindowProcW, GWL_STYLE, GWLP_WNDPROC, GetClientRect, GetWindowLongPtrW, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTLEFT,
+     HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsIconic, IsZoomed, SM_CXPADDEDBORDER, SM_CXSIZEFRAME, SetWindowLongPtrW, WM_GETDPISCALEDSIZE,
+diff -ruN '--exclude=target' '--exclude=wgpu-hal' ./apps/solidcraft/src/startup.rs /home/claude/src/solidcraft-0.18.2/apps/solidcraft/src/startup.rs
+--- a/apps/solidcraft/src/startup.rs	2026-10-21 02:09:18.000000000 +0000
++++ b/apps/solidcraft/src/startup.rs	2026-10-21 12:50:03.993421174 +0000
+@@ -142,7 +142,8 @@
+         return None;
+     }
+     if cpu {
+-        return windows.then_some(Backends::DX12);
++        // Windows 7 has no D3D12 (no WARP): OpenGL is offered beside it.
++        return windows.then_some(Backends::DX12 | Backends::GL);
+     }
+     if let Some(p) = preference.map(str::trim).filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("auto")) {
+         let chosen = Backends::from_comma_list(p);
+@@ -154,7 +155,7 @@
+     if !windows {
+         return None;
+     }
+-    Some(WINDOWS_ORDER.into_iter().find(|b| has_hardware(*b)).unwrap_or(Backends::DX12))
++    Some(WINDOWS_ORDER.into_iter().find(|b| has_hardware(*b)).unwrap_or(Backends::DX12 | Backends::GL))
+ }
+ 
+ /// The device feature for a 32-bit float depth buffer with a stencil (reversed depth, #1434).
+diff -ruN '--exclude=target' '--exclude=wgpu-hal' ./apps/solidcraft/src/win7.rs /home/claude/src/solidcraft-0.18.2/apps/solidcraft/src/win7.rs
+--- a/apps/solidcraft/src/win7.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/apps/solidcraft/src/win7.rs	2026-10-21 15:12:24.672966444 +0000
+@@ -0,0 +1,85 @@
++//! Windows 7 build helpers: a log file for diagnosis (the GUI app has no console) and the
++//! software OpenGL renderer (Mesa llvmpipe in `soft-gl\` next to the exe), loaded before any
++//! OpenGL use when the software renderer is chosen.
++#![allow(unsafe_code)]
++
++use std::io::Write;
++use std::os::windows::io::IntoRawHandle;
++use std::sync::Mutex;
++
++/// `%LOCALAPPDATA%\SolidCraft\solidcraft-log.txt`.
++pub fn log_path() -> Option<std::path::PathBuf> {
++    std::env::var_os("LOCALAPPDATA").map(|d| std::path::PathBuf::from(d).join("SolidCraft").join("solidcraft-log.txt"))
++}
++
++/// Everything written to stderr (eprintln!, the log) goes to the log file from now on.
++pub fn redirect_stderr() {
++    let Some(path) = log_path() else { return };
++    if let Some(dir) = path.parent() {
++        let _ = std::fs::create_dir_all(dir);
++    }
++    let Ok(file) = std::fs::File::create(&path) else { return };
++    let handle = file.into_raw_handle();
++    // SAFETY: a valid, owned file handle, intentionally kept open for the life of the process.
++    // SetStdHandle looked up in kernel32 (keeps windows-sys' feature set unchanged).
++    unsafe {
++        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
++        let k32: Vec<u16> = "kernel32.dll\0".encode_utf16().collect();
++        let m = GetModuleHandleW(k32.as_ptr());
++        if let Some(f) = GetProcAddress(m, b"SetStdHandle\0".as_ptr()) {
++            let f: unsafe extern "system" fn(u32, *mut core::ffi::c_void) -> i32 = std::mem::transmute(f);
++            f(0xFFFF_FFF4, handle as _);
++        }
++    }
++}
++
++struct StderrLog(Mutex<()>);
++
++impl log::Log for StderrLog {
++    fn enabled(&self, m: &log::Metadata) -> bool {
++        let ours = m.target().starts_with("solidcraft");
++        m.level() <= if ours { log::Level::Info } else { log::Level::Warn }
++            || (m.target().starts_with("wgpu") && m.level() <= log::Level::Info)
++            || m.target().starts_with("egui_wgpu") && m.level() <= log::Level::Info
++    }
++    fn log(&self, r: &log::Record) {
++        if self.enabled(r.metadata()) {
++            let _g = self.0.lock();
++            let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
++            let _ = writeln!(std::io::stderr(), "{t} {} {}: {}", r.level(), r.target(), r.args());
++        }
++    }
++    fn flush(&self) {}
++}
++
++static LOGGER: StderrLog = StderrLog(Mutex::new(()));
++
++pub fn install_logger() {
++    if log::set_logger(&LOGGER).is_ok() {
++        log::set_max_level(log::LevelFilter::Info);
++    }
++}
++
++/// Load Mesa's opengl32.dll from `soft-gl\` beside the exe, before anything loads the system
++/// one: every later lookup of `opengl32.dll` (gdi32, wgpu) then gets llvmpipe.
++pub fn preload_software_gl() -> bool {
++    let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.join("soft-gl"))) else { return false };
++    let dll = dir.join("opengl32.dll");
++    if !dll.is_file() {
++        eprintln!("SolidCraft: software OpenGL not found at {}", dll.display());
++        return false;
++    }
++    use std::os::windows::ffi::OsStrExt;
++    let wide: Vec<u16> = dll.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
++    // SAFETY: a NUL-terminated path; LOAD_WITH_ALTERED_SEARCH_PATH finds Mesa's own DLLs beside it.
++    let h = unsafe {
++        windows_sys::Win32::System::LibraryLoader::LoadLibraryExW(
++            wide.as_ptr(),
++            std::ptr::null_mut(),
++            windows_sys::Win32::System::LibraryLoader::LOAD_WITH_ALTERED_SEARCH_PATH,
++        )
++    };
++    let ok = !h.is_null();
++    eprintln!("SolidCraft: software OpenGL (Mesa llvmpipe) {}", if ok { "loaded" } else { "failed to load" });
++    ok
++}
+diff -ruN '--exclude=target' '--exclude=wgpu-hal' ./assets/locales/ru.json /home/claude/src/solidcraft-0.18.2/assets/locales/ru.json
+--- a/assets/locales/ru.json	2026-10-21 02:09:18.000000000 +0000
++++ b/assets/locales/ru.json	2026-10-21 14:52:12.434337397 +0000
+@@ -15,33 +15,33 @@
+   "Active rule": "Активное правило",
+   "Add": "Добавить",
+   "Add Key": "Добавить клавишу",
+-  "Add Mid Radius": "Добавить средний радиус",
++  "Add Mid Radius": "Добавить ср. радиус",
+   "Add Row": "Добавить строку",
+   "Add condition": "Добавить условие",
+-  "Add or edit rule": "Добавить или изменить правило",
++  "Add or edit rule": "Добавить/изменить правило",
+   "Against": "Против",
+   "Alignment": "Выравнивание",
+   "All Sketch Points": "Все точки эскиза",
+   "All components": "Все компоненты",
+-  "All open designs": "Все открытые дизайны",
++  "All open designs": "Все открытые документы",
+   "Allowed expressions, separated by semicolons": "Разрешённые выражения через точку с запятой",
+   "Also deletes": "Также удаляет",
+   "Angle 2": "Угол 2",
+   "Animate": "Анимировать",
+   "Appearance name": "Имя внешнего вида",
+-  "Applied Radius": "Применённый радиус",
++  "Applied Radius": "Факт. радиус",
+   "Apply To": "Применить к",
+-  "Apply to selection": "Применить к выделению",
+-  "Apply your appearance first. Exports assigned appearances and materials created in this design.": "Сначала примените внешний вид. Экспортирует назначенные внешние виды и материалы, созданные в этом дизайне.",
++  "Apply to selection": "Применить к выбранному",
++  "Apply your appearance first. Exports assigned appearances and materials created in this design.": "Сначала примените внешний вид. Экспортирует назначенные внешние виды и материалы, созданные в этом документе.",
+   "Arc length": "Длина дуги",
+   "Area": "Площадь",
+   "As-Built": "По месту",
+   "Assign Rule": "Назначить правило",
+   "Attachment": "Привязка",
+-  "BLEND SURFACE": "СОПРЯГАЮЩАЯ ПОВЕРХНОСТЬ",
++  "BLEND SURFACE": "СОПРЯГАЮЩАЯ ПОВ-ТЬ",
+   "BOUNDARY SURFACE": "ГРАНИЧНАЯ ПОВЕРХНОСТЬ",
+   "BROWSER": "БРАУЗЕР",
+-  "Bend Line Position": "Положение линии гиба",
++  "Bend Line Position": "Положение линии сгиба",
+   "Bend Position": "Положение гиба",
+   "Bend Radius": "Радиус гиба",
+   "Bend Table": "Таблица сгибов",
+@@ -59,37 +59,37 @@
+   "CSV or JSON: updates existing parameters, adds new ones": "CSV или JSON: обновляет существующие параметры, добавляет новые",
+   "Capture All Positions": "Зафиксировать все положения",
+   "Capture Pos.": "Запомнить поз.",
+-  "Catch Direction": "Направление защёлкивания",
++  "Catch Direction": "Направл. защёлки",
+   "Cells": "Ячейки",
+   "Center X": "Центр X",
+   "Center Y": "Центр Y",
+   "Center of mass": "Центр масс",
+   "Centre to centre": "От центра до центра",
+   "Chamfer Type": "Тип фаски",
+-  "Check collisions": "Проверить столкновения",
++  "Check collisions": "Проверять коллизии",
+   "Checked": "Включено",
+   "Choose a new plane. Sketch geometry and dimensions stay unchanged in its two-dimensional coordinates.": "Выберите новую плоскость. Геометрия и размеры эскиза останутся неизменными в её двумерных координатах.",
+   "Choose…": "Выбрать…",
+   "Circular": "Круговой",
+   "Circumference": "Окружность",
+-  "Close draft": "Закрыть анализ уклонов",
++  "Close draft": "Закрыть анализ уклона",
+   "Collisions": "Столкновения",
+   "Colour": "Цвет",
+   "Comment": "Комментарий",
+   "Component1": "Компонент1",
+   "Config Table": "Таблица конфигураций",
+   "Configuration": "Конфигурация",
+-  "Configuration rules": "Правила конфигурации",
++  "Configuration rules": "Правила конфигураций",
+   "Contact": "Контакт",
+   "Contact Sets": "Наборы контактов",
+   "Contact sets": "Наборы контактов",
+   "Continuity": "Непрерывность",
+   "Copy Error Message": "Скопировать сообщение об ошибке",
+   "Copy Warning Message": "Скопировать предупреждение",
+-  "Copy all licences": "Копировать все лицензии",
++  "Copy all licences": "Копировать лицензии",
+   "Copy diagnostic information": "Копировать диагностическую информацию",
+   "Copy report": "Копировать отчёт",
+-  "Copy screenshot": "Копировать скриншот",
++  "Copy screenshot": "Копировать снимок",
+   "Corner Relief": "Разгрузка угла",
+   "Corner Relief Shape": "Форма разгрузки угла",
+   "Counterbore depth": "Глубина цековки",
+@@ -102,7 +102,7 @@
+   "Curv. Comb": "Гребень кривизны",
+   "Curvature (G2)": "Кривизна (G2)",
+   "Curvature change (G3)": "Изменение кривизны (G3)",
+-  "Customize Toolbar": "Настроить панель инструментов",
++  "Customize Toolbar": "Настроить ленту",
+   "Delete": "Удалить",
+   "Delete all": "Удалить все",
+   "Delete rule": "Удалить правило",
+@@ -110,26 +110,26 @@
+   "Delete the set": "Удалить набор",
+   "Density": "Плотность",
+   "Dependents": "Зависимые",
+-  "Designs you open or save appear here.": "Здесь появляются открытые и сохранённые дизайны.",
++  "Designs you open or save appear here.": "Здесь появляются открытые и сохранённые документы.",
+   "Determined by To Object. Choose Angle to edit the angular extent.": "Определяется параметром «До объекта». Выберите «Угол», чтобы задать угловой предел.",
+   "Direction": "Направление",
+   "Discard": "Отменить",
+   "Do not export hidden edges": "Не экспортировать скрытые рёбра",
+-  "Don't ask again": "Больше не спрашивать",
++  "Don't ask again": "Не спрашивать",
+   "Double-click to rename": "Двойной щелчок — переименовать",
+-  "Double-clicking the middle button in the view: Home (the home view, framing what is shown), Fit (frame what is shown, keeping the orientation) or nothing": "Двойной щелчок средней кнопкой в виде: «Главная» (главный вид, кадрирует показанное), «Вписать» (кадрирует, сохраняя ориентацию) или ничего",
+-  "Drive Joint": "Привод сопряжения",
++  "Double-clicking the middle button in the view: Home (the home view, framing what is shown), Fit (frame what is shown, keeping the orientation) or nothing": "Двойной щелчок средней кнопкой в виде: «Исходный вид» (главный вид, кадрирует показанное), «Показать всё» (кадрирует, сохраняя ориентацию) или ничего",
++  "Drive Joint": "Привод соединения",
+   "Duration": "Длительность",
+   "Edges": "Рёбра",
+   "Edit": "Изменить",
+-  "Edit Profile Sketch": "Редактировать эскиз профиля",
++  "Edit Profile Sketch": "Изменить эскиз профиля",
+   "Enable rule": "Включить правило",
+   "Enabled": "Включено",
+   "End bulge": "Выпуклость в конце",
+-  "End continuity": "Непрерывность в конце",
++  "End continuity": "Гладкость в конце",
+   "Explode": "Разобрать",
+   "Explode Text": "Разбить текст",
+-  "Export Animation…": "Экспортировать анимацию…",
++  "Export Animation…": "Экспорт анимации…",
+   "Export CSV…": "Экспорт CSV…",
+   "Export Current View as DXF": "Экспортировать текущий вид в DXF",
+   "Export Current View as DXF…": "Экспортировать текущий вид в DXF…",
+@@ -138,7 +138,7 @@
+   "Export JSON…": "Экспорт JSON…",
+   "Export hidden edges as dashed lines": "Экспортировать скрытые рёбра штриховыми линиями",
+   "Expression": "Выражение",
+-  "Extend to meet": "Продлить до пересечения",
++  "Extend to meet": "Продлить до пересеч.",
+   "Extents": "Пределы",
+   "FILES": "ФАЙЛЫ",
+   "FLAT": "РАЗВЁРТКА",
+@@ -156,8 +156,8 @@
+   "Finish": "Завершить",
+   "Flat Pattern": "Развёртка",
+   "Flat size": "Размер развёртки",
+-  "Follow camera (Look At sketches)": "Следовать за камерой (эскизы «Взгляд на»)",
+-  "Follow the camera (Look At sketches)": "Следовать за камерой (эскизы «Взгляд на»)",
++  "Follow camera (Look At sketches)": "Следовать за камерой (эскизы «Вид по нормали»)",
++  "Follow the camera (Look At sketches)": "Следовать за камерой (эскизы «Вид по нормали»)",
+   "Font": "Шрифт",
+   "From Bodies": "Из тел",
+   "From edges": "Начальные рёбра",
+@@ -173,17 +173,17 @@
+   "Horiz./Vert.": "Гориз./верт.",
+   "IMAGES": "ИЗОБРАЖЕНИЯ",
+   "Import…": "Импорт…",
+-  "In This Design": "В этом дизайне",
+-  "In place (surfaces)": "На месте (поверхности)",
++  "In This Design": "В этом документе",
++  "In place (surfaces)": "На месте (пов-ти)",
+   "In plane": "В плоскости",
+   "Inside": "Внутри",
+   "Interferes": "Пересекается",
+   "Isocurve": "Изокривая",
+   "Issue title": "Заголовок Issue",
+   "JOINTS": "СОЕДИНЕНИЯ",
+-  "Joint Origin1": "Точка сопряжения1",
+-  "Keep (points on it)": "Оставить (точки на нём)",
+-  "Keep Tools": "Оставить инструменты",
++  "Joint Origin1": "Точка соединения1",
++  "Keep (points on it)": "Оставить (с точками)",
++  "Keep Tools": "Сохр. инструм. тела",
+   "Keep of the other surface": "Оставить от другой поверхности",
+   "LIBRARY": "БИБЛИОТЕКА",
+   "LINKS": "ССЫЛКИ",
+@@ -192,11 +192,11 @@
+   "Legacy face attachment. Rebinding to a certified face creates an exact attachment.": "Устаревшая привязка к грани. Перепривязка к сертифицированной грани создаёт точную привязку.",
+   "Length": "Длина",
+   "Length units": "Единицы длины",
+-  "Letter Spacing": "Межбуквенный интервал",
++  "Letter Spacing": "Межбукв. интервал",
+   "Library": "Библиотека",
+   "Library file": "Файл библиотеки",
+-  "Line Spacing": "Межстрочный интервал",
+-  "Local library": "Локальная библиотека",
++  "Line Spacing": "Межстроч. интервал",
++  "Local library": "Локальная библ.",
+   "Loop": "Контур",
+   "MANAGE": "УПРАВЛЕНИЕ",
+   "MATERIALS": "МАТЕРИАЛЫ",
+@@ -216,7 +216,7 @@
+   "Modeled": "Смоделировано",
+   "More toolbar panels": "Другие панели инструментов",
+   "Motion": "Движение",
+-  "Move / Copy": "Переместить / копировать",
++  "Move / Copy": "Перемест./копир.",
+   "Move Type": "Тип перемещения",
+   "Move down": "Переместить вниз",
+   "Move earlier": "Сдвинуть раньше",
+@@ -238,8 +238,8 @@
+   "Notch": "Вырез",
+   "OUTPUT": "ВЫВОД",
+   "Opacity": "Непрозрачность",
+-  "Open GitHub draft": "Открыть черновик на GitHub",
+-  "Open local libraries in the desktop app. You can export this design's library here.": "Открывайте локальные библиотеки в настольном приложении. Здесь можно экспортировать библиотеку этого дизайна.",
++  "Open GitHub draft": "Черновик на GitHub",
++  "Open local libraries in the desktop app. You can export this design's library here.": "Открывайте локальные библиотеки в настольном приложении. Здесь можно экспортировать библиотеку этого документа.",
+   "Open-source parametric 3D CAD in Rust. Licensed MIT OR Apache-2.0.": "Открытая параметрическая 3D CAD на Rust. Лицензия MIT OR Apache-2.0.",
+   "Operator": "Оператор",
+   "Other side": "Другая сторона",
+@@ -257,52 +257,52 @@
+   "Picked": "Выбрано",
+   "Picked point": "Выбранная точка",
+   "Place at the origin instead": "Разместить в начале координат",
+-  "Plastic Rules": "Правила для пластика",
++  "Plastic Rules": "Правила пластика",
+   "Playback": "Воспроизведение",
+   "Plot": "График",
+   "Position": "Положение",
+-  "Position (0 to 1)": "Положение (от 0 до 1)",
++  "Position (0 to 1)": "Положение (0…1)",
+   "Position (G0)": "Положение (G0)",
+   "Position along the edge, 0 at the start end, 1 at the other": "Положение вдоль ребра: 0 — начало, 1 — конец",
+-  "Preferences › Design turns the offer back on": "Настройки › Дизайн снова включают это предложение",
+-  "Preview Row": "Строка предпросмотра",
+-  "Preview leaves the current design unchanged.": "Предпросмотр не меняет текущий дизайн.",
++  "Preferences › Design turns the offer back on": "Настройки › Документ снова включают это предложение",
++  "Preview Row": "Строка предпросм.",
++  "Preview leaves the current design unchanged.": "Предпросмотр не меняет текущий документ.",
+   "Profiles/Curves": "Профили/кривые",
+   "Quantity": "Величина",
+   "RECENT": "НЕДАВНИЕ",
+-  "REFERENCE": "ССЫЛОЧНАЯ ГЕОМЕТРИЯ",
+-  "RULED SURFACE": "ЛИНЕЙЧАТАЯ ПОВЕРХНОСТЬ",
++  "REFERENCE": "Справочные",
++  "RULED SURFACE": "ЛИНЕЙЧАТАЯ ПОВ-ТЬ",
+   "RULES": "ПРАВИЛА",
+   "Radius Fit": "Подобрать радиус",
+   "Ratio": "Отношение",
+   "Reattach selected face": "Перепривязать выбранную грань",
+   "Recover": "Восстановить",
+-  "Recover unsaved design?": "Восстановить несохранённый дизайн?",
++  "Recover unsaved design?": "Восстановить несохранённый документ?",
+   "Rectangular": "Прямоугольная",
+   "Reference face": "Базовая грань",
+-  "Remove Tools": "Убрать инструменты",
++  "Remove Tools": "Удал. инструм. тела",
+   "Remove from list": "Убрать из списка",
+-  "Remove override": "Убрать переопределение",
+-  "Remove private design details or paths before sharing.": "Перед публикацией удалите личные данные и пути из дизайна.",
+-  "Remove screenshot": "Убрать скриншот",
++  "Remove override": "Снять переопредел.",
++  "Remove private design details or paths before sharing.": "Перед публикацией удалите личные данные и пути из документа.",
++  "Remove screenshot": "Убрать снимок экрана",
+   "Remove the column": "Удалить столбец",
+   "Remove the track": "Удалить дорожку",
+   "Remove this point": "Удалить эту точку",
+-  "Report a bug — review a screenshot and open a GitHub draft": "Сообщить об ошибке — проверьте скриншот и откройте черновик на GitHub",
+-  "Reset Toolbar": "Сбросить панель инструментов",
+-  "Resize Part": "Изменить размер детали",
++  "Report a bug — review a screenshot and open a GitHub draft": "Сообщить об ошибке — проверьте снимок экрана и откройте черновик на GitHub",
++  "Reset Toolbar": "Сбросить ленту",
++  "Resize Part": "Изменить типоразмер",
+   "Restore View": "Восстановить вид",
+   "Restore outer boundary": "Восстановить внешнюю границу",
+   "Restore the inherited component or physical material appearance": "Вернуть унаследованный внешний вид компонента или физического материала",
+   "Result": "Результат",
+-  "Retake screenshot": "Сделать скриншот заново",
++  "Retake screenshot": "Переснять снимок",
+   "Reverse": "Обратить",
+-  "Reverse Direction": "Обратить направление",
++  "Reverse Direction": "Обратное направл.",
+   "Revert": "Вернуть",
+   "Revert All Positions": "Вернуть все положения",
+   "Revert Pos.": "Вернуть поз.",
+   "Revert Position": "Вернуть положение",
+-  "Review the report and screenshot before opening GitHub.": "Проверьте отчёт и скриншот перед открытием GitHub.",
++  "Review the report and screenshot before opening GitHub.": "Проверьте отчёт и снимок экрана перед открытием GitHub.",
+   "Rim Edge": "Кромка обода",
+   "Roll History Marker Here": "Переместить маркер истории сюда",
+   "Round": "Круглая",
+@@ -315,21 +315,21 @@
+   "Save View": "Сохранить вид",
+   "Save the study as an animated GIF, seen as the viewport shows it": "Сохранить исследование как анимированный GIF, как его показывает видовой экран",
+   "Saved preview. Geometry is being checked before editing.": "Сохранённый предпросмотр. Геометрия проверяется перед редактированием.",
+-  "Scale factor": "Коэффициент масштаба",
++  "Scale factor": "Коэфф. масштаба",
+   "Scene": "Сцена",
+   "Search": "Поиск",
+   "Search commands": "Поиск команд",
+-  "Search this library": "Поиск в этой библиотеке",
++  "Search this library": "Поиск в библиотеке",
+   "Section": "Сечение",
+-  "Select Other: hold the left button still on the model (or right-click › Select Other…) to list everything under the cursor; click again on the same spot to select the next thing there. Double-click the middle button to go Home (Preferences › Navigation).": "Выбрать другое: удерживайте левую кнопку на модели (или правый щелчок › Выбрать другое…), чтобы увидеть всё под курсором; повторный щелчок в том же месте выбирает следующий объект. Двойной щелчок средней кнопкой — «Главная» (Настройки › Навигация).",
++  "Select Other: hold the left button still on the model (or right-click › Select Other…) to list everything under the cursor; click again on the same spot to select the next thing there. Double-click the middle button to go Home (Preferences › Navigation).": "Выбрать другое: удерживайте левую кнопку на модели (или правый щелчок › Выбрать другое…), чтобы увидеть всё под курсором; повторный щелчок в том же месте выбирает следующий объект. Двойной щелчок средней кнопкой — «Исходный вид» (Настройки › Навигация).",
+   "Select bodies (a face picks its body)": "Выберите тела (выбор грани выбирает её тело)",
+   "Select bodies or faces instead": "Вместо этого выберите тела или грани",
+   "Selection filter": "Фильтр выделения",
+   "Semantic faces share their appearance across instances.": "Семантические грани разделяют внешний вид между вхождениями.",
+   "Send your report on GitHub": "Отправить отчёт на GitHub",
+   "Shape": "Форма",
+-  "Sheet Rules": "Правила для листового металла",
+-  "Show Agent Cursor": "Показывать курсор агента",
++  "Sheet Rules": "Правила листа",
++  "Show Agent Cursor": "Курсор агента",
+   "Show in folder": "Показать в папке",
+   "Show the pointer an AI agent moves (#35)": "Показывать указатель, которым двигается ИИ-агент (#35)",
+   "Signed axes": "Знаковые оси",
+@@ -341,14 +341,14 @@
+   "Sketch plane has no body-face attachment.": "Плоскость эскиза не привязана к грани тела.",
+   "Sketch points": "Точки эскиза",
+   "Slot width": "Ширина паза",
+-  "SolidCraft closed before these designs were saved. Their last autosave can be opened.": "SolidCraft закрылся до сохранения этих дизайнов. Можно открыть последнюю автосохранённую версию.",
++  "SolidCraft closed before these designs were saved. Their last autosave can be opened.": "SolidCraft закрылся до сохранения этих документов. Можно открыть последнюю автосохранённую версию.",
+   "Specialise": "Специализировать",
+   "Speed": "Скорость",
+-  "Stand it up": "Поставить вертикально",
++  "Stand it up": "Поставить верт.",
+   "Stand it up: a quarter turn about X, as one Move feature you can undo.": "Поставить вертикально: четверть оборота вокруг X одной операцией «Переместить», которую можно отменить.",
+-  "Stand this part up?": "Поставить эту деталь вертикально?",
++  "Stand this part up?": "Поставить деталь вертикально?",
+   "Start bulge": "Выпуклость в начале",
+-  "Start continuity": "Непрерывность в начале",
++  "Start continuity": "Гладкость в начале",
+   "Step": "Шаг",
+   "Steps": "Шаги",
+   "Stitch the kept pieces": "Сшить оставленные части",
+@@ -360,7 +360,7 @@
+   "Swap Ends": "Поменять концы",
+   "TRIM": "ОБРЕЗКА",
+   "Tangent (G1)": "Касание (G1)",
+-  "Tangent Chain": "Касательная цепочка",
++  "Tangent Chain": "Цепочка касат.",
+   "Tear": "Разрыв",
+   "The dashed sketch is a saved plane guide. Select a new face to repair the attachment.": "Пунктирный эскиз — сохранённая подсказка плоскости. Выберите новую грань, чтобы восстановить привязку.",
+   "The saved author occurrence is missing. Select a valid author placement before rebinding.": "Сохранённое исходное вхождение отсутствует. Выберите корректное исходное положение перед перепривязкой.",
+@@ -369,7 +369,7 @@
+   "These features will fail:": "Эти операции завершатся с ошибкой:",
+   "Thickness Outside": "Толщина снаружи",
+   "Thin": "Тонкий",
+-  "Thin Extrude": "Тонкое выдавливание",
++  "Thin Extrude": "Тонкостенная",
+   "This child is shared. Deleting it removes it from every copy of its parent.": "Этот дочерний объект общий. Его удаление затронет все копии родителя.",
+   "This child is shared. Position changes apply to every copy of its parent.": "Этот дочерний объект общий. Изменения положения применятся ко всем копиям родителя.",
+   "This face cannot provide a durable attachment. Choose another face or explicitly use a fixed plane.": "Эта грань не может обеспечить надёжную привязку. Выберите другую грань или явно используйте фиксированную плоскость.",
+@@ -384,10 +384,10 @@
+   "Unit": "Единица",
+   "Updating the preview": "Обновление предпросмотра",
+   "Use active author placement": "Использовать активное исходное положение",
+-  "Use fixed plane": "Использовать фиксированную плоскость",
++  "Use fixed plane": "Фикс. плоскость",
+   "Use saved fixed plane": "Использовать сохранённую фиксированную плоскость",
+   "Use selected face as fixed plane": "Использовать выбранную грань как фиксированную плоскость",
+-  "User Parameters": "Пользовательские параметры",
++  "User Parameters": "Параметры польз.",
+   "VIEW": "ВИД",
+   "VIEWS": "ВИДЫ",
+   "Value": "Значение",
+@@ -396,11 +396,11 @@
+   "View navigator": "Навигатор видов",
+   "Volume": "Объём",
+   "Wall": "Стенка",
+-  "Wall Location": "Расположение стенки",
++  "Wall Location": "Положение стенки",
+   "Wall Thickness": "Толщина стенки",
+   "When": "Когда",
+   "Width": "Ширина",
+-  "Will fail": "Завершится с ошибкой",
++  "Will fail": "Будет ошибка",
+   "X angle": "Угол X",
+   "X distance": "Расстояние X",
+   "Y angle": "Угол Y",
+@@ -409,12 +409,12 @@
+   "Z distance": "Расстояние Z",
+   "Zebra": "Зебра",
+   "angle, height": "угол, высота",
+-  "appearance.dielectric_ior": "Показатель преломления диэлектрика",
++  "appearance.dielectric_ior": "Коэфф. преломл.",
+   "appearance.metallic": "Металличность",
+   "appearance.pbr_help": "Просмотр поверхности во вкладке Рендер или на PNG изделия. Без преломления и пропускания света.",
+   "appearance.pbr_opaque": "Непрозрачный PBR",
+   "appearance.roughness": "Шероховатость",
+-  "appearance.surface_response": "Поведение поверхности",
++  "appearance.surface_response": "Отклик поверхности",
+   "browser.body_name": "Тело{number}",
+   "browser.calibrate_title": "Калибровка: {name}",
+   "browser.capture_many": "Компоненты ({count}) перемещены, но их положения не зафиксированы.",
+@@ -430,10 +430,10 @@
+   "cam.flat": "Плоский",
+   "cam.follower": "Толкатель",
+   "cam.knife": "Острие",
+-  "cam.needs_joints": "нужны вращающееся и скользящее или качающееся сопряжения",
++  "cam.needs_joints": "нужны вращающееся и скользящее или качающееся соединения",
+   "cam.roller": "Ролик",
+-  "cam.roller_pick": "Ролик (необязательно)",
+-  "cam.tip_pick": "Острие (необязательно)",
++  "cam.roller_pick": "Ролик (необяз.)",
++  "cam.tip_pick": "Острие (необяз.)",
+   "cmd.appearance_assign": "Внешний вид",
+   "cmd.appearance_library": "Библиотека внешних видов",
+   "cmd.appearance_list": "Список внешних видов",
+@@ -452,11 +452,11 @@
+   "cmd.canvas_insert": "Подложка",
+   "cmd.component_activate": "Активировать компонент",
+   "cmd.component_break_link": "Разорвать связь",
+-  "cmd.component_capture_position": "Зафиксировать положение",
++  "cmd.component_capture_position": "Фиксировать положение",
+   "cmd.component_create": "Новый компонент",
+   "cmd.component_delete": "Удалить компонент",
+-  "cmd.component_from_bodies": "Создать компоненты из тел",
+-  "cmd.component_insert_design": "Вставить дизайн",
++  "cmd.component_from_bodies": "Компоненты из тел",
++  "cmd.component_insert_design": "Вставить документ",
+   "cmd.component_links": "Список связей",
+   "cmd.component_list": "Список компонентов",
+   "cmd.component_metadata": "Свойства детали",
+@@ -464,7 +464,7 @@
+   "cmd.component_move_bodies": "Переместить тела в компонент",
+   "cmd.component_move_sketches": "Переместить эскизы в компонент",
+   "cmd.component_paste_new": "Вставить как новый",
+-  "cmd.component_properties": "Физические свойства компонента",
++  "cmd.component_properties": "МЦХ компонента",
+   "cmd.component_relink": "Перепривязать источник",
+   "cmd.component_rename": "Переименовать компонент",
+   "cmd.component_revert_position": "Вернуть положение",
+@@ -477,7 +477,7 @@
+   "cmd.config_row": "Строка конфигурации",
+   "cmd.config_rule": "Правило конфигурации",
+   "cmd.config_rules": "Правила конфигурации",
+-  "cmd.config_table": "Показать таблицу конфигурации",
++  "cmd.config_table": "Таблица конфигураций",
+   "cmd.construct_axis_edge": "Ось через ребро",
+   "cmd.construct_axis_normal_to_face": "Ось перпендикулярно грани",
+   "cmd.construct_axis_through_cylinder": "Ось через цилиндр/конус/тор",
+@@ -500,20 +500,20 @@
+   "cmd.contact_disable_all": "Отключить контакт",
+   "cmd.contact_edit": "Изменить набор контактов",
+   "cmd.contact_enable_all": "Включить весь контакт",
+-  "cmd.contact_enable_sets": "Включить наборы контактов",
++  "cmd.contact_enable_sets": "Включить контакты",
+   "cmd.contact_list": "Список наборов контактов",
+   "cmd.diagnostics_crash_report": "Отчёт о сбое",
+   "cmd.diagnostics_crash_reports": "Отчёты о сбоях",
+   "cmd.diagnostics_crash_reports_clear": "Удалить отчёты о сбоях",
+   "cmd.diagnostics_crash_test": "Тест сбоя",
+-  "cmd.doc_recover": "Восстановить дизайн",
+-  "cmd.doc_recovery_discard": "Отказаться от восстановленного дизайна",
+-  "cmd.doc_recovery_list": "Восстановимые дизайны",
+-  "cmd.document_inspect": "Инспекция дизайна",
+-  "cmd.document_metadata": "Свойства дизайна",
+-  "cmd.document_metadata_remove": "Удалить свойство дизайна",
+-  "cmd.document_metadata_set": "Изменить свойства дизайна",
+-  "cmd.document_units": "Изменить единицы дизайна",
++  "cmd.doc_recover": "Восстановить документ",
++  "cmd.doc_recovery_discard": "Отказаться от восстановленного документа",
++  "cmd.doc_recovery_list": "Восстановимые документы",
++  "cmd.document_inspect": "Инспекция документа",
++  "cmd.document_metadata": "Свойства документа",
++  "cmd.document_metadata_remove": "Удалить свойство документа",
++  "cmd.document_metadata_set": "Изменить свойства документа",
++  "cmd.document_units": "Единицы документа",
+   "cmd.edit_checkpoint": "Контрольная точка",
+   "cmd.edit_restore_checkpoint": "Вернуть контрольную точку",
+   "cmd.engine_commands": "Список команд",
+@@ -525,44 +525,44 @@
+   "cmd.expr_evaluate": "Вычислить выражение",
+   "cmd.face_delete": "Удалить грань",
+   "cmd.file_export": "Экспорт",
+-  "cmd.file_insert_mesh": "Вставить меш",
++  "cmd.file_insert_mesh": "Вставить сетку",
+   "cmd.file_insert_step": "Вставить STEP",
+-  "cmd.file_save_mesh": "Сохранить как меш",
++  "cmd.file_save_mesh": "Сохранить как сетку",
+   "cmd.file_slicers": "Установленные слайсеры",
+   "cmd.inspect_accessibility": "Анализ доступности",
+   "cmd.inspect_center_of_mass": "Центр масс",
+   "cmd.inspect_clearance": "Зазор",
+   "cmd.inspect_compare": "Сравнить тела",
+   "cmd.inspect_continuity": "Анализ непрерывности",
+-  "cmd.inspect_curvature_comb": "Анализ кривизны (гребёнка)",
++  "cmd.inspect_curvature_comb": "Гребёнка кривизны",
+   "cmd.inspect_curvature_map": "Карта кривизны",
+   "cmd.inspect_draft": "Анализ уклонов",
+   "cmd.inspect_environment_map": "Анализ карты окружения",
+-  "cmd.inspect_interference": "Интерференция",
++  "cmd.inspect_interference": "Коллизии",
+   "cmd.inspect_isocurve": "Анализ изолиний",
+   "cmd.inspect_minimum_radius": "Анализ минимального радиуса",
+   "cmd.inspect_silhouette": "Силуэт",
+   "cmd.inspect_zebra": "Зебра-анализ",
+-  "cmd.joint_as_built": "Сопряжение на месте",
++  "cmd.joint_as_built": "Соединение на месте",
+   "cmd.joint_cam": "Кулачок",
+-  "cmd.joint_create": "Сопряжение",
+-  "cmd.joint_delete": "Удалить сопряжение",
+-  "cmd.joint_drive": "Привод сопряжений",
+-  "cmd.joint_edit": "Изменить сопряжение",
++  "cmd.joint_create": "Соединение",
++  "cmd.joint_delete": "Удалить соединение",
++  "cmd.joint_drive": "Привод соединений",
++  "cmd.joint_edit": "Изменить соединение",
+   "cmd.joint_gear": "Зубчатая передача",
+-  "cmd.joint_inspect": "Проверить сопряжение",
+-  "cmd.joint_limits": "Ограничения сопряжения",
+-  "cmd.joint_list": "Список сопряжений",
++  "cmd.joint_inspect": "Проверить соединение",
++  "cmd.joint_limits": "Пределы соединения",
++  "cmd.joint_list": "Список соединений",
+   "cmd.joint_motion_link": "Связь движений",
+-  "cmd.joint_origin": "Точка сопряжения",
++  "cmd.joint_origin": "Точка соединения",
+   "cmd.joint_rack_pinion": "Реечная передача",
+   "cmd.joint_reach": "Достичь точки",
+   "cmd.joint_rigid_group": "Жёсткая группа",
+   "cmd.joint_screw": "Винт",
+-  "cmd.joint_solve": "Решить сопряжения",
+-  "cmd.joint_sweep": "Прогон сопряжения",
++  "cmd.joint_solve": "Решить соединения",
++  "cmd.joint_sweep": "Прогон соединения",
+   "cmd.library_apply": "Применить элемент локальной библиотеки",
+-  "cmd.library_export": "Экспорт библиотеки дизайнов",
++  "cmd.library_export": "Экспорт библиотеки документов",
+   "cmd.library_inspect": "Просмотр локальной библиотеки",
+   "cmd.material_assign": "Физический материал",
+   "cmd.material_create": "Новый физический материал",
+@@ -571,7 +571,7 @@
+   "cmd.material_list": "Список материалов",
+   "cmd.material_properties_directional": "Направленный модуль упругости",
+   "cmd.material_properties_validate": "Проверить данные физического материала",
+-  "cmd.mesh_convert": "Преобразовать меш",
++  "cmd.mesh_convert": "Сетка в тело",
+   "cmd.model_edges": "Список рёбер",
+   "cmd.model_faces": "Список граней",
+   "cmd.model_threads": "Список резьб",
+@@ -606,32 +606,32 @@
+   "cmd.parts_insert": "Вставить деталь",
+   "cmd.parts_library": "Стандартные детали",
+   "cmd.parts_resize": "Изменить размер детали",
+-  "cmd.plastic_assign_rule": "Назначить правило пластика",
++  "cmd.plastic_assign_rule": "Назначить правило",
+   "cmd.plastic_boss": "Бобышка",
+   "cmd.plastic_lip": "Выступ",
+-  "cmd.plastic_manage_rules": "Управление правилами пластика",
++  "cmd.plastic_manage_rules": "Правила пластика",
+   "cmd.plastic_rest": "Опора",
+   "cmd.plastic_rules": "Список правил пластика",
+   "cmd.plastic_snap_fit": "Защёлка",
+-  "cmd.render_backends": "Рендер-бэкенды",
+-  "cmd.render_cancel": "Отменить рендеринг",
+-  "cmd.render_export": "Экспортировать изображение рендеринга",
+-  "cmd.render_preflight": "Проверить запрос рендеринга",
+-  "cmd.render_scene": "Просмотреть сцену рендеринга",
+-  "cmd.render_settings_apply": "Применить камеру рендеринга",
+-  "cmd.render_settings_get": "Настройки рендеринга",
+-  "cmd.render_settings_set": "Сохранить настройки рендеринга",
+-  "cmd.render_start": "Рендеринг изображения",
+-  "cmd.render_status": "Ход рендеринга",
++  "cmd.render_backends": "Модули визуализации",
++  "cmd.render_cancel": "Прервать визуализацию",
++  "cmd.render_export": "Экспорт изображения",
++  "cmd.render_preflight": "Проверка визуализации",
++  "cmd.render_scene": "Сцена визуализации",
++  "cmd.render_settings_apply": "Применить камеру визуализации",
++  "cmd.render_settings_get": "Параметры визуализации",
++  "cmd.render_settings_set": "Сохранить параметры визуализации",
++  "cmd.render_start": "Визуализировать",
++  "cmd.render_status": "Ход визуализации",
+   "cmd.select_clear": "Снять выделение",
+   "cmd.sheet_convert": "Преобразовать в листовой металл",
+-  "cmd.sheet_export_bend_table": "Экспортировать таблицу гибов",
+-  "cmd.sheet_export_dxf": "Экспортировать развёртку в DXF",
++  "cmd.sheet_export_bend_table": "Таблица гибов",
++  "cmd.sheet_export_dxf": "Развёртка в DXF",
+   "cmd.sheet_flange": "Фланец",
+   "cmd.sheet_flat_pattern": "Создать развёртку",
+   "cmd.sheet_fold": "Гиб",
+-  "cmd.sheet_hem": "Кромка",
+-  "cmd.sheet_manage_rules": "Правила листового металла",
++  "cmd.sheet_hem": "Подгибка",
++  "cmd.sheet_manage_rules": "Правила листа",
+   "cmd.sheet_perforate": "Перфорация",
+   "cmd.sheet_refold": "Повторный гиб",
+   "cmd.sheet_rules": "Список правил листового металла",
+@@ -647,7 +647,7 @@
+   "cmd.sketch_chamfer_distance_angle": "Фаска по расстоянию и углу",
+   "cmd.sketch_chamfer_equal_distance": "Фаска по равным расстояниям",
+   "cmd.sketch_chamfer_two_distance": "Фаска по двум расстояниям",
+-  "cmd.sketch_circle_center": "Окружность по центру и диаметру",
++  "cmd.sketch_circle_center": "Окружность",
+   "cmd.sketch_circle_three_point": "Окружность по 3 точкам",
+   "cmd.sketch_circle_three_tangent": "Окружность по 3 касательным",
+   "cmd.sketch_circle_two_point": "Окружность по 2 точкам",
+@@ -667,7 +667,7 @@
+   "cmd.sketch_edit_text": "Редактировать текст",
+   "cmd.sketch_export_dxf": "Сохранить как DXF",
+   "cmd.sketch_finish_auto_constrain": "Завершить с автоограничениями",
+-  "cmd.sketch_fit_curves_to_section": "Подобрать кривые по сечению меша",
++  "cmd.sketch_fit_curves_to_section": "Кривые по сечению сетки",
+   "cmd.sketch_glyphs": "Знаки ограничений",
+   "cmd.sketch_include_3d": "Включить 3D-геометрию",
+   "cmd.sketch_infinite": "Бесконечная линия",
+@@ -694,7 +694,7 @@
+   "cmd.sketch_rectangle_center": "Прямоугольник из центра",
+   "cmd.sketch_rectangle_rounded": "Скруглённый прямоугольник",
+   "cmd.sketch_rectangle_three_point": "Прямоугольник по 3 точкам",
+-  "cmd.sketch_rectangle_two_point": "Прямоугольник по 2 точкам",
++  "cmd.sketch_rectangle_two_point": "Прямоуг. по 2 точкам",
+   "cmd.sketch_redefine": "Переопределить плоскость эскиза",
+   "cmd.sketch_slot_arc_center": "Дуговой паз из центра",
+   "cmd.sketch_slot_arc_three_point": "Дуговой паз по 3 точкам",
+@@ -716,7 +716,7 @@
+   "cmd.solid_emboss": "Тиснение",
+   "cmd.solid_move": "Переместить/Копировать",
+   "cmd.solid_offset_face": "Смещение грани",
+-  "cmd.solid_press_pull": "Нажать и потянуть",
++  "cmd.solid_press_pull": "Тянуть/толкать",
+   "cmd.solid_remove": "Удалить",
+   "cmd.solid_replace_face": "Заменить грань",
+   "cmd.solid_rib": "Ребро жёсткости",
+@@ -724,19 +724,19 @@
+   "cmd.solid_web": "Перегородка",
+   "cmd.surface_blend": "Сопряжённая поверхность",
+   "cmd.surface_boundary": "Поверхность по границе",
+-  "cmd.surface_extrude": "Выдавливание поверхности",
++  "cmd.surface_extrude": "Выдавливание пов-ти",
+   "cmd.surface_fair": "Сгладить поверхность",
+   "cmd.surface_fillet": "Скругление поверхности",
+-  "cmd.surface_loft": "Лофт поверхности",
++  "cmd.surface_loft": "Пов-ть по сечениям",
+   "cmd.surface_match": "Согласовать поверхность",
+   "cmd.surface_offset": "Смещённая поверхность",
+-  "cmd.surface_patch": "Заплатка",
++  "cmd.surface_patch": "Заплата",
+   "cmd.surface_reverse_normal": "Обратить нормаль",
+-  "cmd.surface_revolve": "Вращение поверхности",
++  "cmd.surface_revolve": "Вращение пов-ти",
+   "cmd.surface_ruled": "Линейчатая поверхность",
+   "cmd.surface_stitch": "Сшить",
+-  "cmd.surface_sweep": "Сдвиг поверхности",
+-  "cmd.surface_thicken": "Утолщить",
++  "cmd.surface_sweep": "Пов-ть по траектории",
++  "cmd.surface_thicken": "Придать толщину",
+   "cmd.surface_unstitch": "Расшить",
+   "cmd.surface_untrim": "Отменить обрезку",
+   "cmd.timeline_add": "Добавить записанную операцию",
+@@ -753,15 +753,15 @@
+   "cmd.timeline_rollback": "Сдвинуть маркер шкалы",
+   "cmd.timeline_suppress": "Подавить операцию",
+   "cmd.view_ambient_occlusion": "Окружающее затенение",
+-  "cmd.view_apply": "Вернуть именованный вид",
++  "cmd.view_apply": "Восстановить вид",
+   "cmd.view_delete": "Удалить именованный вид",
+   "cmd.view_graphics_preset": "Графический профиль",
+   "cmd.view_list": "Список именованных видов",
+   "cmd.view_navigate": "Навигация вида",
+   "cmd.view_rename": "Переименовать именованный вид",
+-  "cmd.view_save": "Новый именованный вид",
++  "cmd.view_save": "Сохранить вид",
+   "color.copy": "Щёлкните, чтобы скопировать значения цвета",
+-  "color.edit": "Щёлкните, чтобы изменить цвет",
++  "color.edit": "Изменить цвет",
+   "color.gamma": "Значения цвета показаны в гамма-пространстве 0–255",
+   "color.hue": "Оттенок",
+   "color.linear": "Значения цвета показаны в линейном пространстве 0–1",
+@@ -770,23 +770,23 @@
+   "contact.components_count": "Компонентов: {count}",
+   "contact.enabled_label": "включено",
+   "coupling.gear_1": "Шестерня 1",
+-  "coupling.gear_1_pick": "Шестерня 1 (необязательно)",
++  "coupling.gear_1_pick": "Колесо 1 (необяз.)",
+   "coupling.gear_2": "Шестерня 2",
+-  "coupling.gear_2_pick": "Шестерня 2 (необязательно)",
+-  "coupling.internal": "Внутреннее зацепление",
+-  "coupling.needs_turn_and_slide": "нужны вращающееся и скользящее сопряжения",
+-  "coupling.needs_turns": "нужны два вращающихся сопряжения",
++  "coupling.gear_2_pick": "Колесо 2 (необяз.)",
++  "coupling.internal": "Внутр. зацепление",
++  "coupling.needs_turn_and_slide": "нужны вращающееся и скользящее соединения",
++  "coupling.needs_turns": "нужны два вращающихся соединения",
+   "coupling.not_round": "не круглая грань",
+   "coupling.nut": "Гайка",
+   "coupling.picked": "выбрано",
+   "coupling.pinion": "Шестерня",
+-  "coupling.pinion_pick": "Шестерня (необязательно)",
++  "coupling.pinion_pick": "Шестерня (необяз.)",
+   "coupling.pitch": "Шаг",
+   "coupling.rack": "Рейка",
+   "coupling.radius_1": "Радиус 1",
+   "coupling.radius_2": "Радиус 2",
+   "crash.announce": "В прошлый раз SolidCraft неожиданно закрылся или столкнулся с внутренней ошибкой. Отчёт о сбое сохранён (Справка > Отчёты о сбоях…).",
+-  "crash.copy_folder": "Копировать путь к папке",
++  "crash.copy_folder": "Копировать путь",
+   "crash.copy_path": "Копировать путь",
+   "crash.deleted": "Удалено отчётов: {count}.",
+   "crash.detected_time": "Обнаружено {time} UTC",
+@@ -835,14 +835,14 @@
+   "file_load.built": "Построено: {built} из {total} операций.",
+   "file_load.converting": "Преобразование тела {done} из {total}",
+   "file_load.inserting": "Вставка геометрии",
+-  "file_load.opening": "Открытие дизайна",
++  "file_load.opening": "Открытие документа",
+   "file_load.preparing_thumbnail": "Подготовка миниатюры...",
+   "file_load.preparing_view": "Подготовка вида...",
+   "file_load.preview_note": "Сохранённый предпросмотр. Перед редактированием проверяется геометрия.",
+   "file_load.reading": "Чтение файла...",
+   "file_load.reading_percent": "Чтение файла... {percent}%",
+   "file_load.rebuilding": "Перестроение операции {done} из {total}",
+-  "file_load.recovering": "Восстановление дизайна",
++  "file_load.recovering": "Восстановление…",
+   "file_load.stopping": "Ожидание остановки предыдущей операции...",
+   "file_load.waiting": "Ожидание файловой операции",
+   "fits the face, e.g. M8": "подходит грани, напр. M8",
+@@ -855,6 +855,12 @@
+   "help.licences": "Лицензии",
+   "help.mit": "Лицензия MIT",
+   "help.notice": "NOTICE",
++  "help.solid.chamfer": "Срезает выбранные рёбра плоской фаской заданного размера. Применяется для притупления острых кромок и для заходных фасок под штифт или винт.",
++  "help.solid.extrude": "Выдавливает профиль эскиза на заданное расстояние, добавляя или удаляя материал. Превращает плоский контур в блок, бобышку или карман.",
++  "help.solid.fillet": "Скругляет выбранные рёбра дугой заданного радиуса. Применяется, чтобы убрать острые кромки — для прочности, удобства или внешнего вида.",
++  "help.solid.hole": "Сверлит круглое отверстие заданного диаметра в выбранной точке грани. Применяется для отверстий под крепёж, штифты и других простых круглых проёмов.",
++  "help.solid.revolve": "Вращает профиль эскиза вокруг оси, создавая тело вращения. Применяется для валов, ручек, чаш и любых деталей, симметричных относительно оси.",
++  "help.solid.shell": "Делает тело полым с заданной толщиной стенки; выбранные грани можно вскрыть. Применяется для корпусов, крышек и других тонкостенных деталей.",
+   "help.third_party": "Лицензии сторонних компонентов",
+   "home.documentation": "Документация",
+   "home.in_this_browser": "в этом браузере",
+@@ -892,7 +898,7 @@
+   "issue.save_screenshot": "Сохранить снимок экрана…",
+   "joint.from_bodies_hint": "Каждое выбранное тело переходит в свой новый компонент и остаётся на месте.",
+   "joint.one_body": "Оба выбора на {body}. Выберите второй на другой детали.",
+-  "joint.one_component": "Эти детали - тела одного компонента: {bodies}. Сопряжение двигает один компонент относительно другого, поэтому каждой детали нужен свой компонент.",
++  "joint.one_component": "Эти детали - тела одного компонента: {bodies}. Соединение двигает один компонент относительно другого, поэтому каждой детали нужен свой компонент.",
+   "keymap.command_id": "ID команды",
+   "keymap.empty": "Нет подходящих команд",
+   "keymap.use_anyway": "Всё равно использовать здесь {key}",
+@@ -916,10 +922,10 @@
+   "messages.title": "Сообщения",
+   "motion.checked_to": "Проверено только до шага {step}: проверка исчерпала свой бюджет работы",
+   "motion.collision": "{a} · {b}: шаги {steps}",
+-  "motion.delete_key": "Удалить ключевой кадр",
++  "motion.delete_key": "Удалить ключ. кадр",
+   "motion.duration_hint": "секунды (пусто: на шаг)",
+-  "motion.key_here": "Вставить ключевой кадр здесь",
+-  "motion.key_here_hint": "Добавить ключевой кадр на этом шаге с текущим значением сопряжения",
++  "motion.key_here": "Ключ. кадр здесь",
++  "motion.key_here_hint": "Добавить ключевой кадр на этом шаге с текущим значением соединения",
+   "motion.no_collisions": "За всё исследование столкновений нет",
+   "motion.step_back": "Шаг назад",
+   "motion.step_forward": "Шаг вперёд",
+@@ -932,12 +938,12 @@
+   "nav.touchpad.pan": "Панорамирование (удерживайте Shift и двигайте; без кнопки мыши)",
+   "nav.touchpad.scroll": "На тачпаде масштаб меняется вертикальной прокруткой. Настройка панорамирования двумя пальцами сохраняется для других пресетов.",
+   "nav.touchpad.zoom": "Масштаб (вертикальная прокрутка или щипок)",
+-  "needs two joints": "нужны два сопряжения",
++  "needs two joints": "нужны два соединения",
+   "new configuration": "новая конфигурация",
+   "new parameter": "новый параметр",
+   "no hole": "без отверстия",
+-  "no interference": "нет интерференции",
+-  "no joint that moves yet": "пока нет подвижных сопряжений",
++  "no interference": "коллизий нет",
++  "no joint that moves yet": "пока нет подвижных соединений",
+   "no picture": "нет картинки",
+   "none": "нет",
+   "parts.automatic_name": "автоматически",
+@@ -945,7 +951,7 @@
+   "pattern.alignment_hint": "Количество включает оригинал. Центрирование распределяет копии по обе стороны; при чётном количестве смена направления выбирает сторону с дополнительной копией.",
+   "pattern.direction_1": "Направление 1",
+   "pattern.direction_2": "Направление 2",
+-  "pattern.flip_direction": "Изменить направление",
++  "pattern.flip_direction": "Обратить направл.",
+   "pick a hole to seat it, or OK places it at the origin": "выберите отверстие для установки, или OK разместит в начале координат",
+   "pick one or two vertices, edges or faces": "выберите одну-две вершины, ребра или грани",
+   "prefs.cpu": "ЦП (программный)",
+@@ -958,40 +964,40 @@
+   "recovery.min_ago": "{count} мин назад",
+   "recovery.never_saved": "не сохранялось",
+   "render.background": "Фон сцены",
+-  "render.fit": "Вписать модель",
+-  "render.image_cancelled": "Рендеринг отменён",
++  "render.fit": "Показать модель",
++  "render.image_cancelled": "Визуализация прервана",
+   "render.image_cancelling": "Отмена",
+   "render.image_completed": "Изображение готово к экспорту",
+   "render.image_encoding": "Кодирование PNG",
+   "render.image_export": "Экспорт PNG",
+-  "render.image_failed": "Ошибка рендеринга",
++  "render.image_failed": "Ошибка визуализации",
+   "render.image_height": "Высота",
+   "render.image_help": "Предпросмотр на CPU · PNG · приближённая прозрачность",
+   "render.image_overwrite": "Заменить существующий файл",
+-  "render.image_preparing": "Подготовка изображения",
+-  "render.image_queued": "Ожидание рендеринга",
++  "render.image_preparing": "Подготовка…",
++  "render.image_queued": "Ожидание визуализации",
+   "render.image_reduce": "Попробуйте уменьшить изображение или упростить сцену.",
+-  "render.image_running": "Рендеринг изображения",
++  "render.image_running": "Визуализация…",
+   "render.image_stale": "Используется сцена, сохранённая до последующих изменений.",
+-  "render.image_start": "Начать рендеринг",
++  "render.image_start": "Начать визуализацию",
+   "render.image_supported": "Запрос поддерживается; при запуске очередь и пул памяти будут проверены снова.",
+-  "render.image_title": "Рендеринг изображения",
++  "render.image_title": "Визуализация",
+   "render.image_too_large": "Превышен предел изображения: 4096 пикселей по стороне и 4 194 304 пикселя всего.",
+   "render.image_transparent": "Прозрачный фон",
+-  "render.image_unknown": "Состояние рендеринга недоступно",
++  "render.image_unknown": "Состояние визуализации неизвестно",
+   "render.image_use_largest": "Использовать наибольший размер с этим соотношением сторон:",
+   "render.image_width": "Ширина",
+   "render.navigation_help": "Камера управляется так же, как в проектировании (Настройки › Навигация). Сохранение набора записывает текущую камеру.",
+   "render.opaque_image_summary": "Предпросмотр PNG · непрозрачный PBR · прозрачность через смешивание",
+   "render.opaque_preview_help": "Непрозрачный PBR и простые цвета; прозрачность через смешивание. Преломление, HDRI и финальный рендер пока недоступны.",
+   "render.perspective": "Перспективная камера",
+-  "render.preview": "Встроенный предпросмотр",
+-  "render.preview_help": "Растровое затенение и смешанная прозрачность. Преломление, HDRI и финальный рендеринг пока недоступны.",
++  "render.preview": "Встр. предпросмотр",
++  "render.preview_help": "Растровое затенение и смешанная прозрачность. Преломление, HDRI и финальный визуализацию пока недоступны.",
+   "render.reload_settings": "Загрузить сохранённые настройки",
+   "render.restore_camera": "Восстановить сохранённую камеру",
+-  "render.return_design": "Вернуться к проектированию",
++  "render.return_design": "К проектированию",
+   "render.save_setup": "Сохранить набор",
+-  "render.setup_name": "Имя набора настроек",
++  "render.setup_name": "Имя настройки",
+   "render.unavailable_preview": "Этот набор запрашивает недоступный профиль предпросмотра.",
+   "render.unsaved": "Несохранённые изменения предпросмотра",
+   "render.use_preview": "Использовать встроенный предпросмотр",
+@@ -1001,15 +1007,15 @@
+   "sample.enclosure.name": "Пластиковый корпус",
+   "sample.flange.about": "Ступица и фланец с круговым массивом, управляемым параметром",
+   "sample.flange.name": "Болтовой фланец",
+-  "sample.hinge.about": "Два компонента и вращательное сопряжение, повёрнутое на 60°",
++  "sample.hinge.about": "Два компонента и вращательное соединение, повёрнутое на 60°",
+   "sample.hinge.name": "Сборка шарнира",
+   "sample.plate.about": "Параметрическая пластина со скруглениями, отверстиями и расточенной бобышкой",
+   "sample.plate.name": "Образец пластины",
+   "sample.vents.about": "Пазы в прямоугольном массиве: число рядов, столбцов и шаг заданы параметрами",
+-  "sample.vents.name": "Вентиляционная пластина",
++  "sample.vents.name": "Вентиляц. пластина",
+   "search.command_keys": "Enter выполнить     Shift+Enter выполнить и оставить открытым     Esc закрыть",
+   "search.commands": "Команды",
+-  "search.design": "В этом дизайне",
++  "search.design": "В этом документе",
+   "search.feature": "Операция",
+   "search.invalid": "Недопустимо",
+   "search.keys": "↑ ↓ выбрать     Enter выполнить     Tab подставить имя     Esc закрыть",
+@@ -1018,9 +1024,9 @@
+   "search.recent": "Недавние",
+   "search.run": "Выполнить команду",
+   "search.suggest": "Вы имели в виду {label}?",
+-  "search.try": "Введите название команды, операцию этого дизайна или параметр. Чтобы выполнить команду со значениями, введите её id и объект JSON: {example}",
++  "search.try": "Введите название команды, операцию этого документа или параметр. Чтобы выполнить команду со значениями, введите её id и объект JSON: {example}",
+   "search.valid": "Допустимо",
+-  "settings.display_quality_note": "Более высокие уровни рисуют криволинейные грани и рёбра глаже, но сетка строится дольше. Меняется только видовой экран, но не дизайн и не экспорт.",
++  "settings.display_quality_note": "Более высокие уровни рисуют криволинейные грани и рёбра глаже, но сетка строится дольше. Меняется только видовой экран, но не документ и не экспорт.",
+   "settings.frame_rate_note": "Показывает кадры в секунду в правом нижнем углу вида. Пока включено, вид перерисовывается непрерывно.",
+   "settings.measure_axis_distances": "Расстояния X/Y/Z",
+   "settings.measure_axis_distances_help": "Показывать размеры вдоль мировых осей вместе с общим расстоянием, пока открыто окно измерения.",
+@@ -1062,7 +1068,7 @@
+   "sketch_text.use_font_file": "Использовать файл шрифта {path}",
+   "solid": "тело",
+   "the parts library is not available": "библиотека деталей недоступна",
+-  "thread.automatic_size": "Автоматический размер",
++  "thread.automatic_size": "Авто размер",
+   "thread.designation": "Обозначение",
+   "thread.iso_metric": "Метрическая ISO",
+   "thread.select_size": "Выберите размер",
+@@ -1075,7 +1081,7 @@
+   "to the face": "до грани",
+   "to the next face": "до следующей грани",
+   "toolbar.customize_note": "Вкладка {tab}. Отметьте команду, чтобы добавить её кнопку на панель инструментов. Можно также перетащить строку из выпадающего меню панели на панель инструментов, перетащить кнопку за пределы панели для удаления или использовать значок закрепления в строке выпадающего меню.",
+-  "toolbar.image": "ИЗОБРАЖЕНИЕ",
++  "toolbar.image": "Снимок",
+   "toolbar.render": "РЕНДЕРИНГ",
+   "toolbar.render_scene": "СЦЕНА",
+   "trace.points": "{count} точек на траектории",
+@@ -1124,11 +1130,11 @@
+   "ui.agent_chat_edit": "Изменить",
+   "ui.agent_chat_exited": "Агент остановлен.",
+   "ui.agent_chat_failed_start": "Не удалось запустить агент: {error}",
+-  "ui.agent_chat_file_cad_not_read": "{name}: файл CAD импортируется в дизайн, а не читается",
++  "ui.agent_chat_file_cad_not_read": "{name}: файл CAD импортируется в документ, а не читается",
+   "ui.agent_chat_file_empty_picture": "{name}: пустое изображение",
+   "ui.agent_chat_file_error": "{name}: {error}",
+   "ui.agent_chat_file_heic": "{name}: изображения HEIC здесь не читаются; сначала экспортируйте в JPEG или PNG",
+-  "ui.agent_chat_file_importing": "Импорт в дизайн…",
++  "ui.agent_chat_file_importing": "Импорт в документ…",
+   "ui.agent_chat_file_kinds": "{name}: можно прикреплять изображения (PNG, JPEG, GIF, WebP, BMP, TIFF), текстовые файлы (включая SVG) и файлы CAD (STEP, IGES, FreeCAD, Rhino, STL, 3MF, OBJ, glTF)",
+   "ui.agent_chat_file_loading": "Чтение файла…",
+   "ui.agent_chat_file_not_a_file": "{name}: не файл",
+@@ -1144,7 +1150,7 @@
+   "ui.agent_chat_files_loading": "Ожидание чтения файлов",
+   "ui.agent_chat_files_max": "Не более {max} файлов в одном сообщении",
+   "ui.agent_chat_import_failed": "{name}: не удалось импортировать: {error}",
+-  "ui.agent_chat_intro": "Общайтесь с уже используемым кодирующим агентом или выбранной конечной точкой модели. Он работает с открытым дизайном через инструменты SolidCraft: изменения видны по мере выполнения и отменяются одним шагом на сообщение. Что ему разрешено без запроса, задаётся в Настройки > ИИ.",
++  "ui.agent_chat_intro": "Общайтесь с уже используемым кодирующим агентом или выбранной конечной точкой модели. Он работает с открытым документом через инструменты SolidCraft: изменения видны по мере выполнения и отменяются одним шагом на сообщение. Что ему разрешено без запроса, задаётся в Настройки > ИИ.",
+   "ui.agent_chat_key_in_env": "ключ задан",
+   "ui.agent_chat_left": "Слева",
+   "ui.agent_chat_limit": "Агент достиг предела в {limit} изменений на одно сообщение. Отправьте ещё одно сообщение, чтобы он продолжил.",
+@@ -1153,8 +1159,8 @@
+   "ui.agent_chat_new": "Новый чат",
+   "ui.agent_chat_new_confirm": "Начать новый чат? Текущий будет очищен.",
+   "ui.agent_chat_next_picture": "Следующее изображение",
+-  "ui.agent_chat_no_cli": "solidcraft-cli не найден рядом с приложением, поэтому агент не может получить доступ к дизайну.",
+-  "ui.agent_chat_no_control": "Конечная точка чата с агентом не запустилась, поэтому агент не может получить доступ к дизайну.",
++  "ui.agent_chat_no_cli": "solidcraft-cli не найден рядом с приложением, поэтому агент не может получить доступ к документу.",
++  "ui.agent_chat_no_control": "Конечная точка чата с агентом не запустилась, поэтому агент не может получить доступ к документу.",
+   "ui.agent_chat_no_images": "Этот агент не принимает изображения",
+   "ui.agent_chat_no_picture": "В буфере обмена нет изображения",
+   "ui.agent_chat_none_found": "Кодирующий агент не найден. Установите один из них и нажмите «Обновить»:",
+@@ -1165,7 +1171,7 @@
+   "ui.agent_chat_paste_picture": "Вставить изображение",
+   "ui.agent_chat_permission": "Агент просит выполнить: {title}",
+   "ui.agent_chat_pick": "Агент",
+-  "ui.agent_chat_placeholder": "Попросите агента изменить дизайн…",
++  "ui.agent_chat_placeholder": "Попросите агента изменить документ…",
+   "ui.agent_chat_placeholder_busy": "Поставьте сообщение в очередь на момент, когда агент закончит (Ctrl+Enter: отправить сейчас)",
+   "ui.agent_chat_pop_out": "Открыть в отдельном окне, которое можно перенести на другой экран",
+   "ui.agent_chat_previous_picture": "Предыдущее изображение",
+@@ -1179,13 +1185,13 @@
+   "ui.agent_chat_refused": "Агенту не разрешено: {reason}",
+   "ui.agent_chat_remove": "Убрать из очереди",
+   "ui.agent_chat_remove_file": "Убрать из этого сообщения",
+-  "ui.agent_chat_remove_imported": "Убрать из этого сообщения; деталь останется в дизайне (Отмена удалит её)",
++  "ui.agent_chat_remove_imported": "Убрать из этого сообщения; деталь останется в документе (Отмена удалит её)",
+   "ui.agent_chat_right": "Справа",
+   "ui.agent_chat_save": "Сохранить",
+   "ui.agent_chat_send": "Отправить",
+   "ui.agent_chat_send_now": "Отправить сейчас",
+   "ui.agent_chat_send_now_tip": "Остановить текущий шаг агента и отправить это следующим (Ctrl+Enter)",
+-  "ui.agent_chat_side": "Сторона чата с агентом",
++  "ui.agent_chat_side": "Сторона чата",
+   "ui.agent_chat_signed_in": "вход выполнен",
+   "ui.agent_chat_state_auth": "Требуется вход",
+   "ui.agent_chat_state_busy": "Работает…",
+@@ -1238,9 +1244,9 @@
+   "ui.ai_keychain_error": "Системная связка ключей отказала: {error}",
+   "ui.ai_mode_all": "Разрешать всё",
+   "ui.ai_mode_all_note": "Ничего не спрашивается. Отчёты о сбоях остаются недоступными, ограничения по папкам действуют.",
+-  "ui.ai_mode_all_warning": "Агент может сохранять, перезаписывать, экспортировать и заменять ваш дизайн без запроса. Используйте это только с доверенным агентом и для сохранённых дизайнов.",
++  "ui.ai_mode_all_warning": "Агент может сохранять, перезаписывать, экспортировать и заменять ваш документ без запроса. Используйте это только с доверенным агентом и для сохранённых документов.",
+   "ui.ai_mode_ask": "Спрашивать каждый раз",
+-  "ui.ai_mode_ask_note": "Каждое изменение дизайна и каждое действие с файлами ждёт вашего «Разрешить».",
++  "ui.ai_mode_ask_note": "Каждое изменение документа и каждое действие с файлами ждёт вашего «Разрешить».",
+   "ui.ai_mode_edits": "Автоматически разрешать правки модели",
+   "ui.ai_mode_edits_note": "Команды моделирования выполняются без запроса; сохранение, открытие, экспорт и другие файловые или разрушающие действия по-прежнему требуют подтверждения.",
+   "ui.ai_mode_global": "Как задано выше",
+@@ -1262,7 +1268,7 @@
+   "ui.ai_reset": "Сбросить",
+   "ui.ai_settings": "Настройки ИИ…",
+   "ui.ai_show_features": "Показывать функции ИИ",
+-  "ui.ai_show_features_note": "Чат с агентом: панель, в которой уже используемый вами кодирующий агент или выбранная конечная точка модели работает с открытым дизайном. Выключено: нет кнопки ИИ, сочетания клавиш, пункта меню и панели, ничего не ищется и не запускается.",
++  "ui.ai_show_features_note": "Чат с агентом: панель, в которой уже используемый вами кодирующий агент или выбранная конечная точка модели работает с открытым документом. Выключено: нет кнопки ИИ, сочетания клавиш, пункта меню и панели, ничего не ищется и не запускается.",
+   "ui.ai_switch_tip": "Сменить агента для этого разговора",
+   "ui.ai_test": "Проверить",
+   "ui.ai_test_acp_ok": "Отвечает: {agent}",
+@@ -1281,12 +1287,12 @@
+   "ui.ai_undo_tip": "Отменить всё, что агент изменил для этого сообщения, одним шагом",
+   "ui.ai_url_hint": "https://example.com/v1",
+   "ui.all": "Все",
+-  "ui.ambient_occlusion": "Окружающее затенение",
++  "ui.ambient_occlusion": "Затенение (AO)",
+   "ui.ambient_occlusion_help": "Мягкое затенение в местах соприкосновения непрозрачных поверхностей. Требуется видовой экран GPU.",
+   "ui.analysis": "Анализ",
+   "ui.angle": "Угол",
+-  "ui.angle_decimals": "Знаков после запятой (углы)",
+-  "ui.animateJoint": "Анимировать сопряжение",
++  "ui.angle_decimals": "Знаков (углы)",
++  "ui.animateJoint": "Анимировать соединение",
+   "ui.animate_view_changes": "Анимировать смену вида",
+   "ui.animation": "Анимация",
+   "ui.animation_speed": "Скорость анимации",
+@@ -1295,21 +1301,21 @@
+   "ui.arc": "Дуга",
+   "ui.assistant": "Ассистент",
+   "ui.assistant_waiting": "Ожидают подтверждения: {count}",
+-  "ui.autosave_every": "Автосохранение каждые",
++  "ui.autosave_every": "Автосохр. каждые",
+   "ui.axes": "Оси",
+   "ui.axis": "Ось",
+   "ui.back": "Назад",
+   "ui.base_point": "Базовая точка",
+   "ui.blocked": "Заблокировано",
+   "ui.bodies": "Тела",
+-  "ui.bodies_all_if_none": "Тела (все, если не выбраны)",
+-  "ui.box": "Бокс",
++  "ui.bodies_all_if_none": "Тела (пусто — все)",
++  "ui.box": "Параллелепипед",
+   "ui.break": "Разорвать",
+   "ui.browser_bodies_one": "{count} тело",
+   "ui.browser_bodies_other": "{count} тел",
+   "ui.browser_collapse": "Свернуть браузер",
+   "ui.browser_expand": "Развернуть браузер",
+-  "ui.browser_title": "Браузер",
++  "ui.browser_title": "Дерево модели",
+   "ui.calibrate": "Калибровать",
+   "ui.cancel": "Отмена",
+   "ui.canvases": "Подложки",
+@@ -1381,7 +1387,7 @@
+   "ui.default_modelling_orientation": "Ориентация моделирования по умолчанию",
+   "ui.delete": "Удалить",
+   "ui.depth": "Глубина",
+-  "ui.design": "Дизайн",
++  "ui.design": "Документ",
+   "ui.design_properties.author": "Автор",
+   "ui.design_properties.description": "Описание",
+   "ui.design_properties.exports": "Экспорт в STEP, IGES и 3MF записывает эти свойства, если в формате для них есть поле.",
+@@ -1389,14 +1395,14 @@
+   "ui.design_properties.not_text": "Сохранено не как текст; ввод здесь заменит значение.",
+   "ui.design_properties.organization": "Организация",
+   "ui.design_properties.others": "Данные других программ",
+-  "ui.design_properties.others_note": "Хранятся в дизайне без изменений и никогда не экспортируются.",
++  "ui.design_properties.others_note": "Хранятся в документе без изменений и никогда не экспортируются.",
+   "ui.design_properties.part_number": "Номер детали",
+   "ui.design_properties.project": "Проект",
+   "ui.design_properties.revision": "Редакция",
+   "ui.diameter": "Диаметр",
+   "ui.dimension": "Размер",
+   "ui.direction": "Направление",
+-  "ui.display_quality": "Качество отображения",
++  "ui.display_quality": "Качество отображ.",
+   "ui.display_quality_coarse": "Грубое",
+   "ui.display_quality_fine": "Точное",
+   "ui.display_quality_normal": "Обычное",
+@@ -1410,14 +1416,14 @@
+   "ui.drawing": "Чертёж",
+   "ui.drill_point": "Конус сверла",
+   "ui.edit": "Изменить",
+-  "ui.editJointLimits": "Изменить ограничения сопряжения",
++  "ui.editJointLimits": "Пределы соединения",
+   "ui.edit_section_analysis": "Изменить анализ сечения",
+   "ui.ellipse": "Эллипс",
+   "ui.end_radius": "Конечный радиус",
+   "ui.end_scale": "Масштаб в конце",
+   "ui.entities": "Объекты",
+   "ui.equal": "Равенство",
+-  "ui.equivalent_radius": "Эквивалентный радиус",
++  "ui.equivalent_radius": "Эквив. радиус",
+   "ui.expand": "Развернуть",
+   "ui.exportDxf": "Экспорт DXF…",
+   "ui.export_ellipsis_keymap": "Экспорт…",
+@@ -1435,20 +1441,20 @@
+   "ui.findInTimeline": "Найти на шкале",
+   "ui.findInWindow": "Найти в окне",
+   "ui.finish_sketch": "Завершить эскиз",
+-  "ui.fit": "Вписать",
+-  "ui.fix_unfix": "Зафиксировать/Освободить",
++  "ui.fit": "Показать всё",
++  "ui.fix_unfix": "Фиксировать/освободить",
+   "ui.flat": "Плоский",
+   "ui.flip": "Перевернуть",
+   "ui.format": "Формат",
+   "ui.frame_rate": "Частота кадров",
+   "ui.front": "Спереди",
+-  "ui.fully_constrained": "Полностью определён",
++  "ui.fully_constrained": "Полностью опред.",
+   "ui.function": "Функция",
+   "ui.general": "Общие",
+   "ui.graphics": "Графика",
+   "ui.graphics_custom": "Настраиваемый",
+   "ui.graphics_performance": "Производительность",
+-  "ui.graphics_preset": "Графический профиль",
++  "ui.graphics_preset": "Профиль графики",
+   "ui.graphics_preset_help": "Качество: окружающее затенение, детальная тесселяция и адаптивный суперсэмплинг 2×. Производительность: без затенения, обычная тесселяция и без суперсэмплинга. Ручные изменения отображаются как настраиваемые. MSAA не меняется.",
+   "ui.graphics_quality": "Качество",
+   "ui.grid_follows_view": "Сетка следует за видом",
+@@ -1464,7 +1470,7 @@
+   "ui.heading_combine": "ОБЪЕДИНЕНИЕ",
+   "ui.heading_configure": "КОНФИГУРАЦИЯ",
+   "ui.heading_constraints": "ОГРАНИЧЕНИЯ",
+-  "ui.heading_construct": "ПОСТРОЕНИЕ",
++  "ui.heading_construct": "Вспомог.",
+   "ui.heading_create": "СОЗДАТЬ",
+   "ui.heading_create_sketch": "СОЗДАТЬ ЭСКИЗ",
+   "ui.heading_cylinder": "ЦИЛИНДР",
+@@ -1473,7 +1479,7 @@
+   "ui.heading_edit": "ИЗМЕНИТЬ",
+   "ui.heading_extrude": "ВЫДАВЛИВАНИЕ",
+   "ui.heading_fillet": "СКРУГЛЕНИЕ",
+-  "ui.heading_finish_sketch": "ЗАВЕРШИТЬ ЭСКИЗ",
++  "ui.heading_finish_sketch": "Завершить эскиз",
+   "ui.heading_front": "СПЕРЕДИ",
+   "ui.heading_hole": "ОТВЕРСТИЕ",
+   "ui.heading_home": "ГЛАВНАЯ",
+@@ -1502,7 +1508,7 @@
+   "ui.heading_rectangular_pattern": "ПРЯМОУГОЛЬНЫЙ МАССИВ",
+   "ui.heading_revolve": "ВРАЩЕНИЕ",
+   "ui.heading_right": "СПРАВА",
+-  "ui.heading_save_mesh": "СОХРАНИТЬ КАК МЕШ",
++  "ui.heading_save_mesh": "СОХРАНИТЬ КАК СЕТКУ",
+   "ui.heading_scale": "МАСШТАБ",
+   "ui.heading_section_analysis": "АНАЛИЗ СЕЧЕНИЯ",
+   "ui.heading_select": "ВЫБРАТЬ",
+@@ -1525,16 +1531,16 @@
+   "ui.hide": "Скрыть",
+   "ui.hideAxes": "Скрыть оси",
+   "ui.hideDimension": "Скрыть размер",
+-  "ui.hideOrigin": "Скрыть начало координат",
++  "ui.hideOrigin": "Скрыть начало коорд.",
+   "ui.hidePlanes": "Скрыть плоскости",
+   "ui.hideProfile": "Скрыть профиль",
+   "ui.history_title": "История",
+   "ui.hole": "Отверстие",
+-  "ui.hole_tap_type": "Тип резьбы отверстия",
++  "ui.hole_tap_type": "Тип резьбы",
+   "ui.hole_type": "Тип отверстия",
+-  "ui.home": "Главная",
++  "ui.home": "Исходный вид",
+   "ui.homeView": "Главный вид",
+-  "ui.horizontal_vertical": "Горизонталь/Вертикаль",
++  "ui.horizontal_vertical": "Гориз./верт.",
+   "ui.import_ellipsis": "Импорт…",
+   "ui.infinite": "Бесконечная",
+   "ui.insert": "Вставить",
+@@ -1542,16 +1548,16 @@
+   "ui.intersect": "Пересечение",
+   "ui.isolate": "Изолировать",
+   "ui.join": "Объединить",
+-  "ui.joints": "Сопряжения",
++  "ui.joints": "Соединения",
+   "ui.keyboard_shortcuts": "Сочетания клавиш",
+   "ui.language": "Язык",
+-  "ui.length_decimals": "Знаков после запятой (длины)",
++  "ui.length_decimals": "Знаков (длины)",
+   "ui.light": "Светлая",
+   "ui.line": "Линия",
+   "ui.lock": "Заблокировать",
+-  "ui.loft": "Лофт",
+-  "ui.look_at": "Взгляд на",
+-  "ui.look_at_anim_desc": "Осевые виды, «Взгляд на», «Главная» и «Вписать»",
++  "ui.loft": "По сечениям",
++  "ui.look_at": "Вид по нормали",
++  "ui.look_at_anim_desc": "Осевые виды, «Вид по нормали», «Исходный вид» и «Показать всё»",
+   "ui.manipulator_free_alt": "Свободное перетаскивание манипулятора также по Alt/Option",
+   "ui.manipulator_free_alt_tip": "Вкл.: Alt/Option или Ctrl/Cmd на стрелках выдавливания / гизмо отключают привязку значений. Выкл.: только Ctrl/Cmd.",
+   "ui.manufacture": "Производство",
+@@ -1568,12 +1574,12 @@
+   "ui.material_review.properties": "Свойства",
+   "ui.material_review.review": "Проверить карточку",
+   "ui.material_review.scope": "Только кандидат: без назначения и сохранения. Численная проверка не является инженерной сертификацией.",
+-  "ui.material_review.shear_strength": "Прочность при сдвиге",
++  "ui.material_review.shear_strength": "Предел прочн. (сдвиг)",
+   "ui.material_review.source": "Источник",
+-  "ui.material_review.specific_heat": "Удельная теплоёмкость",
+-  "ui.material_review.tensile_strength": "Прочность при растяжении",
++  "ui.material_review.specific_heat": "Уд. теплоёмкость",
++  "ui.material_review.tensile_strength": "Предел прочн. (растяж.)",
+   "ui.material_review.thermal_conductivity": "Теплопроводность",
+-  "ui.material_review.thermal_expansion": "Тепловое расширение",
++  "ui.material_review.thermal_expansion": "КТЛР",
+   "ui.material_review.title": "Проверка физических данных материала",
+   "ui.material_review.unknown": "Неизвестно",
+   "ui.material_review.yield_strength": "Предел текучести",
+@@ -1587,10 +1593,10 @@
+   "ui.multiple": "Несколько",
+   "ui.named_views": "Именованные виды",
+   "ui.navigation": "Навигация",
+-  "ui.needs_design": "{command}: сначала откройте дизайн",
++  "ui.needs_design": "{command}: сначала откройте документ",
+   "ui.newSketchGroup": "Новая группа эскизов",
+   "ui.new_body": "Новое тело",
+-  "ui.new_design": "Новый дизайн",
++  "ui.new_design": "Новый документ",
+   "ui.no_geometry_yet": "Геометрии пока нет",
+   "ui.no_slicer_found": "Слайсер не найден",
+   "ui.normal": "Нормаль",
+@@ -1608,15 +1614,15 @@
+   "ui.open_recent": "Открыть недавние",
+   "ui.operation": "Операция",
+   "ui.options": "Параметры",
+-  "ui.orbit": "Орбита",
++  "ui.orbit": "Поворот",
+   "ui.orbit_around": "Вращать вокруг",
+   "ui.orientation": "Ориентация",
+   "ui.origin": "Начало координат",
+   "ui.palette_construction_mode": "Вспомогательный режим (X)",
+   "ui.palette_more": "Ещё",
+   "ui.palette_sketch_options": "Параметры эскиза",
+-  "ui.pan": "Панорамирование",
+-  "ui.pan_zoom_orbit": "Панорама, масштаб, орбита",
++  "ui.pan": "Сдвиг",
++  "ui.pan_zoom_orbit": "Сдвиг, масштаб, поворот",
+   "ui.parallel": "Параллельность",
+   "ui.parameters": "Параметры",
+   "ui.part_size_shared": "Перестраивает деталь, заменяя все добавленные операции. Обновляются все вхождения этого компонента.",
+@@ -1625,7 +1631,7 @@
+   "ui.pattern_on_path": "Массив по траектории",
+   "ui.perpendicular": "Перпендикулярность",
+   "ui.perspective_view": "Перспективный вид",
+-  "ui.pinToShortcuts": "Закрепить в сочетаниях клавиш",
++  "ui.pinToShortcuts": "В быстрые команды",
+   "ui.pinToToolbar": "Закрепить на панели",
+   "ui.pipe": "Труба",
+   "ui.placement": "Размещение",
+@@ -1649,27 +1655,27 @@
+   "ui.project": "Проецировать",
+   "ui.project_face_edges_sketch": "Проецировать рёбра граней в новые эскизы",
+   "ui.properties": "Свойства",
+-  "ui.pull_direction": "Направление вытягивания",
++  "ui.pull_direction": "Направл. извлечения",
+   "ui.quantity": "Количество",
+   "ui.quantity_2": "Количество 2",
+   "ui.quit": "Выход",
+   "ui.radial_context_menu": "Радиальное контекстное меню",
+   "ui.radius": "Радиус",
+   "ui.rail": "Направляющая",
+-  "ui.rail_fit": "Подгонка по направляющей",
++  "ui.rail_fit": "Подгонка по направл.",
+   "ui.reachable": "Достижимо",
+   "ui.rectangle": "Прямоугольник",
+-  "ui.rectangular_pattern": "Прямоугольный массив",
++  "ui.rectangular_pattern": "Массив по сетке",
+   "ui.redo": "Повторить",
+   "ui.relink_design_changed": "Сборка изменилась во время выбора источника. Запустите «Перепривязать источник» снова.",
+   "ui.relink_done": "Источник перепривязан для всех экземпляров.",
+-  "ui.relink_not_linked": "Этот компонент не связан с исходным дизайном.",
++  "ui.relink_not_linked": "Этот компонент не связан с исходным документом.",
+   "ui.relink_select_one": "Сначала выберите один связанный компонент или один из его экземпляров.",
+   "ui.relink_source_all": "Перепривязать источник (все экземпляры)…",
+   "ui.removeFromToolbar": "Убрать с панели",
+   "ui.removeSection": "Убрать сечение",
+-  "ui.render": "Рендер",
+-  "ui.renderer": "Рендерер",
++  "ui.render": "Визуализация",
++  "ui.renderer": "Визуализатор",
+   "ui.repeat": "Повторить",
+   "ui.report_a_bug": "Сообщить об ошибке",
+   "ui.reset": "Сбросить",
+@@ -1694,7 +1700,7 @@
+   "ui.sbox_pin": "Закрепить вверху панели S",
+   "ui.sbox_unpin": "Открепить",
+   "ui.scale": "Масштаб",
+-  "ui.second_rail": "Вторая направляющая",
++  "ui.second_rail": "2-я направляющая",
+   "ui.section_analysis": "Анализ сечения",
+   "ui.select": "Выбрать",
+   "ui.selectOther": "Выбрать другое…",
+@@ -1713,7 +1719,7 @@
+   "ui.showAllBodies": "Показать все тела",
+   "ui.showAxes": "Показать оси",
+   "ui.showDimension": "Показать размер",
+-  "ui.showOrigin": "Показать начало координат",
++  "ui.showOrigin": "Показать начало коорд.",
+   "ui.showPlanes": "Показать плоскости",
+   "ui.show_constraints": "Ограничения",
+   "ui.show_construction_geometries": "Вспомогательная геометрия",
+@@ -1781,10 +1787,10 @@
+   "ui.suppress": "Подавить",
+   "ui.suppress_auto_snap": "Подавлять автопривязку при рисовании / перетаскивании",
+   "ui.suppress_auto_snap_note": "По умолчанию: Ctrl/Cmd или Alt/Option подавляют привязку эскиза. Выберите одну клавишу, чтобы сузить это.",
+-  "ui.sweep": "Сдвиг",
+-  "ui.sweep_follow_direction": "Следовать направлению",
++  "ui.sweep": "По траектории",
++  "ui.sweep_follow_direction": "По направлению",
+   "ui.sweep_keep_as_drawn": "Как нарисовано",
+-  "ui.sweep_turn_with_path": "Поворачивать по траектории",
++  "ui.sweep_turn_with_path": "Поворот по траект.",
+   "ui.symmetric": "Симметрично",
+   "ui.symmetry": "Симметрия",
+   "ui.system": "Системная",
+@@ -1802,7 +1808,7 @@
+   "ui.timeline_left_sidebar": "Левая боковая панель",
+   "ui.tip_angle": "Угол при вершине",
+   "ui.to_object": "До объекта",
+-  "ui.tool_direction": "Направление инструмента",
++  "ui.tool_direction": "Направл. инструмента",
+   "ui.top": "Сверху",
+   "ui.torus": "Тор",
+   "ui.total_angle": "Полный угол",
+@@ -1811,21 +1817,21 @@
+   "ui.twist": "Закрутка",
+   "ui.two_finger_scroll_pans": "Прокрутка двумя пальцами панорамирует",
+   "ui.two_sides": "Две стороны",
+-  "ui.ui_scale": "Масштаб интерфейса",
++  "ui.ui_scale": "Масштаб интерф.",
+   "ui.undo": "Отменить",
+   "ui.unground": "Открепить",
+   "ui.unisolate": "Снять изоляцию",
+   "ui.units": "Единицы",
+-  "ui.units_of_new_designs": "Единицы новых дизайнов",
++  "ui.units_of_new_designs": "Единицы новых документов",
+   "ui.unlock": "Разблокировать",
+-  "ui.unsuppress": "Восстановить операцию",
++  "ui.unsuppress": "Включить операцию",
+   "ui.untied_ends_tip": "Касается только по положению",
+   "ui.untitled": "Без имени",
+-  "ui.up_axis_note": "Какая ось направлена вверх в видах (осевые виды, «Главная», «Взгляд на»). Дизайны не меняются.",
++  "ui.up_axis_note": "Какая ось направлена вверх в видах (осевые виды, «Исходный вид», «Вид по нормали»). Документы не меняются.",
+   "ui.updateToCurrentView": "Обновить до текущего вида",
+   "ui.view_centre": "Центр вида",
+   "ui.visual_shaded_hidden_edges": "Заполненный с невидимыми рёбрами",
+-  "ui.visual_shaded_with_edges": "Заполненный с рёбрами",
++  "ui.visual_shaded_with_edges": "Тонир. с рёбрами",
+   "ui.visual_style": "Стиль отображения",
+   "ui.visual_wireframe": "Каркас",
+   "ui.workspace": "рабочая область",
+@@ -1835,10 +1841,10 @@
+   "ui.workspace_design_description": "Эскиз, моделирование, сборка и проверка",
+   "ui.workspace_design_tabs": "Модель · Поверхность · Сборка · Вставка · Проверка · Управление · Вид",
+   "ui.workspace_drawing_description": "2D-чертежи с видами, размерами и основными надписями",
+-  "ui.workspace_footer": "Все рабочие среды работают с одним дизайном, историей и выбором; меняются только вкладки ленты. Переключатель заблокирован, пока редактируется эскиз или операция.",
++  "ui.workspace_footer": "Все рабочие среды работают с одним документом, историей и выбором; меняются только вкладки ленты. Переключатель заблокирован, пока редактируется эскиз или операция.",
+   "ui.workspace_manufacture_description": "Слайсинг, траектории инструмента и наладка",
+   "ui.workspace_planned": "Запланировано",
+-  "ui.workspace_render_description": "Предпросмотр изделия, настройки сцены и отрендеренные изображения",
++  "ui.workspace_render_description": "Предпросмотр изделия, параметры сцены, готовые изображения",
+   "ui.workspace_render_tabs": "Сцена · Изображение",
+   "ui.workspace_simulation_description": "Нагрузки, ограничения и результаты",
+   "ui.x_distance": "Расстояние X",
+@@ -1883,4 +1889,4 @@
+   "update.update_now": "Обновить сейчас",
+   "update.you_have": "У вас {version}.",
+   "↑ ↓ choose · Enter / Tab complete · Esc dismiss": "↑ ↓ выбрать · Enter / Tab дополнить · Esc закрыть"
+-}
++}
+\ No newline at end of file
+diff -ruN '--exclude=target' '--exclude=wgpu-hal' ./crates/ui-egui/src/toolbar.rs /home/claude/src/solidcraft-0.18.2/crates/ui-egui/src/toolbar.rs
+--- a/crates/ui-egui/src/toolbar.rs	2026-10-21 02:09:18.000000000 +0000
++++ b/crates/ui-egui/src/toolbar.rs	2026-10-21 14:49:53.306076334 +0000
+@@ -101,7 +101,7 @@
+ const BUTTON_HEIGHT: f32 = 60.0;
+ const BUTTON_GAP: f32 = 3.0;
+ const BUTTON_MIN_WIDTH: f32 = 54.0;
+-const BUTTON_MAX_WIDTH: f32 = 76.0;
++const BUTTON_MAX_WIDTH: f32 = 96.0;
+ const BUTTON_LABEL_PADDING: f32 = 10.0;
+ const SECTION_HEIGHT: f32 = 20.0;
+ 
+@@ -751,11 +751,21 @@
+ 
+ /// Ribbon headings use the translated labels, with normal word casing instead of registry caps.
+ fn ribbon_label(app: &SolveApp, label: &str) -> String {
+-    let label = app
+-        .tr_label(label)
++    let translated = app.tr_label(label);
++    // Non-Latin catalogs (Russian, …): sentence case — only the first word capitalised,
++    // short acronyms (DXF, 3D) kept as written.
++    let sentence = translated.chars().any(|c| c.is_alphabetic() && !c.is_ascii());
++    let label = translated
+         .split_whitespace()
+-        .map(|word| {
++        .enumerate()
++        .map(|(i, word)| {
++            if sentence && (word.chars().count() <= 4 && word.chars().any(|c| c.is_ascii_digit() || c.is_ascii_uppercase()) && !word.chars().any(|c| c.is_lowercase())) {
++                return word.to_string();
++            }
+             let lower = word.to_lowercase();
++            if sentence && i > 0 {
++                return lower;
++            }
+             let mut chars = lower.chars();
+             chars.next().map(|c| c.to_uppercase().collect::<String>() + chars.as_str()).unwrap_or_default()
+         })
+diff -ruN '--exclude=target' '--exclude=wgpu-hal' ./crates/ui-egui/src/ui_kit/metrics.rs /home/claude/src/solidcraft-0.18.2/crates/ui-egui/src/ui_kit/metrics.rs
+--- a/crates/ui-egui/src/ui_kit/metrics.rs	2026-10-21 02:09:18.000000000 +0000
++++ b/crates/ui-egui/src/ui_kit/metrics.rs	2026-10-21 14:49:45.819839778 +0000
+@@ -25,7 +25,7 @@
+ pub(super) const LABEL_ACTIONS_SHARE: f32 = 0.45;
+ 
+ /// Widest a label column may grow, as a multiple of `form_label_width`.
+-const LABEL_COLUMN_MAX: f32 = 1.6;
++const LABEL_COLUMN_MAX: f32 = 1.85;
+ 
+ /// Measured width of a label in the form label font. Tokens: `font_label, dialog_label`.
+ pub(super) fn label_width(ui: &Ui, text: &str) -> f32 {

@@ -1,0 +1,20 @@
+LIBRARY w7shim.dll
+EXPORTS
+  CoTaskMemFree = ole32.CoTaskMemFree
+  CoCreateFreeThreadedMarshaler = ole32.CoCreateFreeThreadedMarshaler
+  RoOriginateErrorW = w7_RoOriginateErrorW
+  PathCchStripPrefix = w7_PathCchStripPrefix
+  CancelIoEx = kernel32.CancelIoEx
+  CreateFileW = kernel32.CreateFileW
+  DeviceIoControl = kernel32.DeviceIoControl
+  GetFinalPathNameByHandleW = kernel32.GetFinalPathNameByHandleW
+  GetOverlappedResultEx = w7_GetOverlappedResultEx
+  GlobalAlloc = kernel32.GlobalAlloc
+  GlobalLock = kernel32.GlobalLock
+  GlobalSize = kernel32.GlobalSize
+  GlobalUnlock = kernel32.GlobalUnlock
+  MoveFileExW = kernel32.MoveFileExW
+  ReOpenFile = kernel32.ReOpenFile
+  ReadFile = kernel32.ReadFile
+  SetFileAttributesW = kernel32.SetFileAttributesW
+  WriteFile = kernel32.WriteFile

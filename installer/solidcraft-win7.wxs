@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi" xmlns:util="http://schemas.microsoft.com/wix/UtilExtension">
+  <Product Id="*" Name="SolidCraft 0.18.2 (Windows 7, Direct3D 11)" Language="1049" Codepage="1251" Version="0.18.8"
+           Manufacturer="SolidCraft contributors" UpgradeCode="6A145FD6-D285-428D-AE84-A69570CDF4DB">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" SummaryCodepage="1251"
+             Description="SolidCraft - параметрическая 3D CAD" Comments="Windows 7 SP1 x64, ANGLE / Direct3D 11" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="Уже установлена более новая версия SolidCraft." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="mszip" />
+    <Icon Id="SolidcraftIcon.exe" SourceFile="solidcraft.ico" />
+    <Property Id="ARPPRODUCTICON" Value="SolidcraftIcon.exe" />
+    <Property Id="ARPURLINFOABOUT" Value="https://docs.solidcraft.io/" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder"><Directory Id="INSTALLDIR" Name="SolidCraft" /></Directory>
+      <Directory Id="ProgramMenuFolder" />
+      <Directory Id="DesktopFolder" />
+    </Directory>
+    <!-- An upgrade installs where the previous version is. -->
+    <Property Id="PREVIOUSDIR"><RegistrySearch Id="PrevDir" Root="HKLM" Key="Software\SolidCraft" Name="InstallDir" Type="raw" Win64="yes" /></Property>
+    <SetDirectory Id="INSTALLDIR" Value="[PREVIOUSDIR]" Sequence="ui">PREVIOUSDIR</SetDirectory>
+
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="App" Guid="C3A1E5D2-4B7F-4A61-9E0D-2F8B6C1A7D01" Win64="yes">
+        <File Id="AppExe" Name="solidcraft-angle.exe" Source="s7\solidcraft-angle.exe" KeyPath="yes" />
+        <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="SolidCraft" Description="SolidCraft - параметрическая 3D CAD"
+                  Target="[INSTALLDIR]solidcraft-angle.exe" WorkingDirectory="INSTALLDIR" />
+        <Shortcut Id="SafeModeShortcut" Directory="ProgramMenuFolder" Name="SolidCraft (безопасный режим)" Description="SolidCraft с настройками по умолчанию"
+                  Target="[INSTALLDIR]solidcraft-angle.exe" Arguments="--safe-mode" WorkingDirectory="INSTALLDIR" />
+        <Shortcut Id="DesktopShortcut" Directory="DesktopFolder" Name="SolidCraft" Description="SolidCraft - параметрическая 3D CAD"
+                  Target="[INSTALLDIR]solidcraft-angle.exe" WorkingDirectory="INSTALLDIR" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.solidcraft" Value="Solidcraft.Design" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.solidcraft" Name="Content Type" Value="application/x-solidcraft" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Solidcraft.Design" Value="SolidCraft Design" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Solidcraft.Design\DefaultIcon" Value="[INSTALLDIR]solidcraft-angle.exe,0" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Solidcraft.Design\shell\open\command" Value='"[INSTALLDIR]solidcraft-angle.exe" "%1"' Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Solidcraft.Model" Value="3D model" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Solidcraft.Model\DefaultIcon" Value="[INSTALLDIR]solidcraft-angle.exe,0" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Solidcraft.Model\shell\open\command" Value='"[INSTALLDIR]solidcraft-angle.exe" "%1"' Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.step\OpenWithProgids" Name="Solidcraft.Model" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.stp\OpenWithProgids" Name="Solidcraft.Model" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.igs\OpenWithProgids" Name="Solidcraft.Model" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.iges\OpenWithProgids" Name="Solidcraft.Model" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.3mf\OpenWithProgids" Name="Solidcraft.Model" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\.stl\OpenWithProgids" Name="Solidcraft.Model" Value="" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\solidcraft-angle.exe" Name="FriendlyAppName" Value="SolidCraft" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Classes\Applications\solidcraft-angle.exe\shell\open\command" Value='"[INSTALLDIR]solidcraft-angle.exe" "%1"' Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\App Paths\solidcraft-angle.exe" Value="[INSTALLDIR]solidcraft-angle.exe" Type="string" />
+        <RegistryValue Root="HKLM" Key="Software\SolidCraft" Name="InstallDir" Value="[INSTALLDIR]" Type="string" />
+      </Component>
+      <Component Id="Angle" Guid="C3A1E5D2-4B7F-4A61-9E0D-2F8B6C1A7D02" Win64="yes">
+        <File Id="AngleEgl" Name="libEGL.dll" Source="s7\libEGL.dll" KeyPath="yes" />
+        <File Id="AngleGles" Name="libGLESv2.dll" Source="s7\libGLESv2.dll" />
+        <File Id="AngleD3dc" Name="d3dcompiler_47.dll" Source="s7\d3dcompiler_47.dll" />
+        <File Id="W7Shim" Name="w7shim.dll" Source="s7\w7shim.dll" />
+      </Component>
+      <Component Id="Cli" Guid="C3A1E5D2-4B7F-4A61-9E0D-2F8B6C1A7D03" Win64="yes">
+        <File Id="CliExe" Name="solidcraft-cli.exe" Source="s7\solidcraft-cli.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="Docs" Guid="C3A1E5D2-4B7F-4A61-9E0D-2F8B6C1A7D04" Win64="yes">
+        <File Id="Readme" Name="README-WIN7.txt" Source="s7\README-WIN7.txt" KeyPath="yes" />
+        <File Id="LicMit" Name="LICENSE-MIT.txt" Source="s7\LICENSE-MIT" />
+        <File Id="LicApache" Name="LICENSE-APACHE.txt" Source="s7\LICENSE-APACHE" />
+        <File Id="Notice" Name="NOTICE.txt" Source="s7\NOTICE" />
+        <File Id="ThirdParty" Name="THIRD-PARTY-LICENSES.txt" Source="s7\THIRD-PARTY-LICENSES.txt" />
+        <File Id="AngleLic" Name="ANGLE-ELECTRON-LICENSE.txt" Source="s7\ANGLE-ELECTRON-LICENSE.txt" />
+      </Component>
+    </DirectoryRef>
+    <Feature Id="Main" Title="SolidCraft" Level="1">
+      <ComponentRef Id="App" /><ComponentRef Id="Angle" /><ComponentRef Id="Cli" /><ComponentRef Id="Docs" />
+    </Feature>
+
+    <!-- Мастер установки: приветствие, выбор папки (по умолчанию C:\Program Files\SolidCraft), готово, ход, завершение. -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLDIR" />
+    <UIRef Id="WixUI_InstallDir" />
+    <UI>
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="2">NOT Installed</Publish>
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2">1</Publish>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApp">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed</Publish>
+    </UI>
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="SolidCraft установлен в папку [INSTALLDIR]" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Запустить SolidCraft" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#AppExe]" />
+    <CustomAction Id="LaunchApp" BinaryKey="WixCA" DllEntry="WixShellExec" Impersonate="yes" Return="ignore" />
+  </Product>
+</Wix>
